@@ -34,7 +34,6 @@ class VTableDetector;
 class TypePropagator;
 class PseudocodeRewriter;
 class StructurePersistence;
-class UIIntegration;
 
 // ============================================================================
 // Core Constants

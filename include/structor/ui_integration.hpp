@@ -19,230 +19,18 @@ public:
     action_state_t idaapi update(action_update_ctx_t* ctx) override;
 };
 
-/// UI integration and callback management
-class UIIntegration {
-public:
-    static UIIntegration& instance() {
-        static UIIntegration ui;
-        return ui;
-    }
-
-    /// Initialize UI hooks and register actions
-    bool initialize();
-
-    /// Cleanup UI hooks and unregister actions
-    void shutdown();
-
-    /// Execute synthesis on selected variable
-    SynthResult execute_synthesis(vdui_t* vdui);
-
-    /// Show conflict resolution dialog
-    bool show_conflict_dialog(const qvector<AccessConflict>& conflicts);
-
-    /// Show synthesis result summary
-    void show_result_dialog(const SynthResult& result);
-
-    /// Open structure view for synthesized type
-    void open_struct_view(tid_t tid);
-
-    /// Get the action handler
-    [[nodiscard]] SynthActionHandler* action_handler() noexcept {
-        return &action_handler_;
-    }
-
-private:
-    UIIntegration() = default;
-    ~UIIntegration() = default;
-    UIIntegration(const UIIntegration&) = delete;
-    UIIntegration& operator=(const UIIntegration&) = delete;
-
-    SynthResult do_synthesis(cfunc_t* cfunc, int var_idx, const SynthOptions& opts);
-
-    SynthActionHandler action_handler_;
-    bool initialized_ = false;
-};
-
 /// Hex-Rays callback handler
-class HexRaysHooks {
-public:
-    HexRaysHooks() = default;
-
+struct HexRaysHooks {
     static ssize_t idaapi callback(void* ud, hexrays_event_t event, va_list va);
 };
 
-// ============================================================================
-// SynthActionHandler Implementation
-// ============================================================================
+/// UI integration - stateless functions, no singleton
+namespace ui {
 
-inline int SynthActionHandler::activate(action_activation_ctx_t* ctx) {
-    // Get the vdui from context
-    vdui_t* vdui = get_widget_vdui(ctx->widget);
-    if (!vdui) {
-        msg("Structor: No pseudocode view active\n");
-        return 0;
-    }
+inline bool g_initialized = false;
 
-    // Execute synthesis
-    SynthResult result = UIIntegration::instance().execute_synthesis(vdui);
-
-    if (!result.success()) {
-        msg("Structor: %s\n", synth_error_str(result.error));
-        if (!result.error_message.empty()) {
-            msg("  Details: %s\n", result.error_message.c_str());
-        }
-    }
-
-    return 1;
-}
-
-inline action_state_t SynthActionHandler::update(action_update_ctx_t* ctx) {
-    // Enable only in pseudocode view
-    vdui_t* vdui = get_widget_vdui(ctx->widget);
-    if (!vdui || !vdui->cfunc) {
-        return AST_DISABLE;
-    }
-
-    // Check if cursor is on a variable
-    if (!vdui->item.is_citem()) {
-        return AST_DISABLE;
-    }
-
-    const citem_t* item = vdui->item.it;
-    if (!item) {
-        return AST_DISABLE;
-    }
-
-    // Navigate to find a variable
-    const cexpr_t* expr = nullptr;
-    if (item->is_expr()) {
-        expr = static_cast<const cexpr_t*>(item);
-    }
-
-    // Check if we can find a variable
-    while (expr) {
-        if (expr->op == cot_var) {
-            return AST_ENABLE;
-        }
-        if (expr->op == cot_cast || expr->op == cot_ref ||
-            expr->op == cot_ptr || expr->op == cot_memptr ||
-            expr->op == cot_idx) {
-            expr = expr->x;
-        } else {
-            break;
-        }
-    }
-
-    return AST_DISABLE;
-}
-
-// ============================================================================
-// UIIntegration Implementation
-// ============================================================================
-
-inline bool UIIntegration::initialize() {
-    if (initialized_) return true;
-
-    // Register action
-    const action_desc_t action_desc = ACTION_DESC_LITERAL(
-        ACTION_NAME,
-        ACTION_LABEL,
-        &action_handler_,
-        Config::instance().hotkey(),
-        "Create structure from access patterns",
-        -1
-    );
-
-    if (!register_action(action_desc)) {
-        msg("Structor: Failed to register action\n");
-        return false;
-    }
-
-    // Install Hex-Rays callback
-    if (!install_hexrays_callback(HexRaysHooks::callback, nullptr)) {
-        msg("Structor: Failed to install Hex-Rays callback\n");
-        unregister_action(ACTION_NAME);
-        return false;
-    }
-
-    initialized_ = true;
-    return true;
-}
-
-inline void UIIntegration::shutdown() {
-    if (!initialized_) return;
-
-    remove_hexrays_callback(HexRaysHooks::callback, nullptr);
-    unregister_action(ACTION_NAME);
-
-    initialized_ = false;
-}
-
-inline SynthResult UIIntegration::execute_synthesis(vdui_t* vdui) {
-    if (!vdui || !vdui->cfunc) {
-        return SynthResult::make_error(SynthError::InternalError, "No decompilation available");
-    }
-
-    // Get variable at cursor
-    auto [var, var_idx] = utils::get_var_at_cursor(vdui);
-    if (!var || var_idx < 0) {
-        return SynthResult::make_error(SynthError::NoVariableSelected, "No variable at cursor position");
-    }
-
-    // Check if variable already has a structure type
-    const SynthOptions& opts = Config::instance().options();
-    tinfo_t var_type = var->type();
-
-    if (!var_type.empty() && var_type.is_ptr()) {
-        tinfo_t pointed = var_type.get_pointed_object();
-        if (!pointed.empty() && pointed.is_struct()) {
-            if (opts.interactive_mode) {
-                if (!utils::ask_yes_no("Variable already has a structure type. Retype?")) {
-                    return SynthResult::make_error(SynthError::InvalidVariable, "User cancelled retype");
-                }
-            }
-        }
-    }
-
-    // Perform synthesis
-    SynthResult result = do_synthesis(vdui->cfunc, var_idx, opts);
-
-    // Handle conflicts
-    if (result.has_conflicts() && opts.interactive_mode) {
-        if (!show_conflict_dialog(result.conflicts)) {
-            return SynthResult::make_error(SynthError::ConflictingAccesses, "User cancelled due to conflicts");
-        }
-    }
-
-    // Show result in interactive mode
-    if (result.success()) {
-        if (opts.auto_open_struct && result.struct_tid != BADADDR) {
-            open_struct_view(result.struct_tid);
-        }
-
-        // Refresh pseudocode view
-        vdui->refresh_view(true);
-
-        if (opts.highlight_changes && result.synthesized_struct) {
-            PseudocodeRewriter rewriter(opts);
-            RewriteResult rw_result = rewriter.rewrite(vdui->cfunc, var_idx, *result.synthesized_struct);
-            rewriter.highlight_transforms(vdui, rw_result);
-        }
-
-        msg("Structor: Created %s with %d fields",
-            result.synthesized_struct ? result.synthesized_struct->name.c_str() : "<unknown>",
-            result.fields_created);
-
-        if (result.vtable_slots > 0) {
-            msg(", %d vtable slots", result.vtable_slots);
-        }
-
-        msg("\n");
-    }
-
-    return result;
-}
-
-inline SynthResult UIIntegration::do_synthesis(cfunc_t* cfunc, int var_idx, const SynthOptions& opts) {
+/// Execute synthesis on selected variable
+inline SynthResult do_synthesis(cfunc_t* cfunc, int var_idx, const SynthOptions& opts) {
     SynthResult result;
 
     // Step 1: Collect access patterns
@@ -332,7 +120,8 @@ inline SynthResult UIIntegration::do_synthesis(cfunc_t* cfunc, int var_idx, cons
     return result;
 }
 
-inline bool UIIntegration::show_conflict_dialog(const qvector<AccessConflict>& conflicts) {
+/// Show conflict resolution dialog
+inline bool show_conflict_dialog(const qvector<AccessConflict>& conflicts) {
     qstring msg_text;
     msg_text = "The following access conflicts were detected:\n\n";
 
@@ -349,7 +138,8 @@ inline bool UIIntegration::show_conflict_dialog(const qvector<AccessConflict>& c
     return ask_yn(ASKBTN_YES, "%s", msg_text.c_str()) == ASKBTN_YES;
 }
 
-inline void UIIntegration::show_result_dialog(const SynthResult& result) {
+/// Show synthesis result summary
+inline void show_result_dialog(const SynthResult& result) {
     qstring msg_text;
 
     if (result.success()) {
@@ -376,10 +166,176 @@ inline void UIIntegration::show_result_dialog(const SynthResult& result) {
     info("%s", msg_text.c_str());
 }
 
-inline void UIIntegration::open_struct_view(tid_t tid) {
-    // Open the local types window
-    // tid is the ordinal, we can pass it to open_loctypes_window
+/// Open structure view for synthesized type
+inline void open_struct_view(tid_t tid) {
     open_loctypes_window(static_cast<int>(tid));
+}
+
+/// Execute synthesis on selected variable in vdui
+inline SynthResult execute_synthesis(vdui_t* vdui) {
+    if (!vdui || !vdui->cfunc) {
+        return SynthResult::make_error(SynthError::InternalError, "No decompilation available");
+    }
+
+    // Get variable at cursor
+    auto [var, var_idx] = utils::get_var_at_cursor(vdui);
+    if (!var || var_idx < 0) {
+        return SynthResult::make_error(SynthError::NoVariableSelected, "No variable at cursor position");
+    }
+
+    // Check if variable already has a structure type
+    const SynthOptions& opts = Config::instance().options();
+    tinfo_t var_type = var->type();
+
+    if (!var_type.empty() && var_type.is_ptr()) {
+        tinfo_t pointed = var_type.get_pointed_object();
+        if (!pointed.empty() && pointed.is_struct()) {
+            if (opts.interactive_mode) {
+                if (!utils::ask_yes_no("Variable already has a structure type. Retype?")) {
+                    return SynthResult::make_error(SynthError::InvalidVariable, "User cancelled retype");
+                }
+            }
+        }
+    }
+
+    // Perform synthesis
+    SynthResult result = do_synthesis(vdui->cfunc, var_idx, opts);
+
+    // Handle conflicts
+    if (result.has_conflicts() && opts.interactive_mode) {
+        if (!show_conflict_dialog(result.conflicts)) {
+            return SynthResult::make_error(SynthError::ConflictingAccesses, "User cancelled due to conflicts");
+        }
+    }
+
+    // Show result in interactive mode
+    if (result.success()) {
+        if (opts.auto_open_struct && result.struct_tid != BADADDR) {
+            open_struct_view(result.struct_tid);
+        }
+
+        // Refresh pseudocode view
+        vdui->refresh_view(true);
+
+        if (opts.highlight_changes && result.synthesized_struct) {
+            PseudocodeRewriter rewriter(opts);
+            RewriteResult rw_result = rewriter.rewrite(vdui->cfunc, var_idx, *result.synthesized_struct);
+            rewriter.highlight_transforms(vdui, rw_result);
+        }
+
+        msg("Structor: Created %s with %d fields",
+            result.synthesized_struct ? result.synthesized_struct->name.c_str() : "<unknown>",
+            result.fields_created);
+
+        if (result.vtable_slots > 0) {
+            msg(", %d vtable slots", result.vtable_slots);
+        }
+
+        msg("\n");
+    }
+
+    return result;
+}
+
+/// Initialize UI hooks and register actions
+inline bool initialize(SynthActionHandler* handler) {
+    if (g_initialized) return true;
+
+    // Register action
+    const action_desc_t action_desc = ACTION_DESC_LITERAL(
+        ACTION_NAME,
+        ACTION_LABEL,
+        handler,
+        Config::instance().hotkey(),
+        "Create structure from access patterns",
+        -1
+    );
+
+    if (!register_action(action_desc)) {
+        msg("Structor: Failed to register action\n");
+        return false;
+    }
+
+    // Install Hex-Rays callback
+    if (!install_hexrays_callback(HexRaysHooks::callback, nullptr)) {
+        msg("Structor: Failed to install Hex-Rays callback\n");
+        unregister_action(ACTION_NAME);
+        return false;
+    }
+
+    g_initialized = true;
+    return true;
+}
+
+/// Cleanup UI hooks and unregister actions
+inline void shutdown() {
+    if (!g_initialized) return;
+
+    remove_hexrays_callback(HexRaysHooks::callback, nullptr);
+    unregister_action(ACTION_NAME);
+
+    g_initialized = false;
+}
+
+} // namespace ui
+
+// ============================================================================
+// SynthActionHandler Implementation
+// ============================================================================
+
+inline int SynthActionHandler::activate(action_activation_ctx_t* ctx) {
+    vdui_t* vdui = get_widget_vdui(ctx->widget);
+    if (!vdui) {
+        msg("Structor: No pseudocode view active\n");
+        return 0;
+    }
+
+    SynthResult result = ui::execute_synthesis(vdui);
+
+    if (!result.success()) {
+        msg("Structor: %s\n", synth_error_str(result.error));
+        if (!result.error_message.empty()) {
+            msg("  Details: %s\n", result.error_message.c_str());
+        }
+    }
+
+    return 1;
+}
+
+inline action_state_t SynthActionHandler::update(action_update_ctx_t* ctx) {
+    vdui_t* vdui = get_widget_vdui(ctx->widget);
+    if (!vdui || !vdui->cfunc) {
+        return AST_DISABLE;
+    }
+
+    if (!vdui->item.is_citem()) {
+        return AST_DISABLE;
+    }
+
+    const citem_t* item = vdui->item.it;
+    if (!item) {
+        return AST_DISABLE;
+    }
+
+    const cexpr_t* expr = nullptr;
+    if (item->is_expr()) {
+        expr = static_cast<const cexpr_t*>(item);
+    }
+
+    while (expr) {
+        if (expr->op == cot_var) {
+            return AST_ENABLE;
+        }
+        if (expr->op == cot_cast || expr->op == cot_ref ||
+            expr->op == cot_ptr || expr->op == cot_memptr ||
+            expr->op == cot_idx) {
+            expr = expr->x;
+        } else {
+            break;
+        }
+    }
+
+    return AST_DISABLE;
 }
 
 // ============================================================================
@@ -394,7 +350,6 @@ inline ssize_t HexRaysHooks::callback(void* ud, hexrays_event_t event, va_list v
             vdui_t* vdui = va_arg(va, vdui_t*);
 
             if (vdui && vdui->cfunc) {
-                // Check if we're on a variable
                 auto [var, var_idx] = utils::get_var_at_cursor(vdui);
                 if (var && var_idx >= 0) {
                     attach_action_to_popup(widget, popup, ACTION_NAME);
@@ -403,10 +358,8 @@ inline ssize_t HexRaysHooks::callback(void* ud, hexrays_event_t event, va_list v
             break;
         }
 
-        case hxe_double_click: {
-            // Could handle double-click on synthesized types here
+        case hxe_double_click:
             break;
-        }
 
         default:
             break;

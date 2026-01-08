@@ -109,7 +109,7 @@ static void unregister_idc_funcs() {
     }
 }
 
-/// Plugin descriptor
+/// Plugin descriptor - owns the action handler to ensure proper lifetime
 class StructorPlugin : public plugmod_t, public event_listener_t {
 public:
     StructorPlugin();
@@ -120,6 +120,8 @@ public:
 
 private:
     void cleanup();
+    
+    SynthActionHandler action_handler_;  // Owned by plugin, passed to IDA
     bool initialized_ = false;
     bool cleaned_up_ = false;
 };
@@ -134,8 +136,8 @@ StructorPlugin::StructorPlugin() {
     // Hook UI notifications to cleanup before widget destruction
     hook_event_listener(HT_UI, this);
 
-    // Initialize UI
-    if (UIIntegration::instance().initialize()) {
+    // Initialize UI - pass our action handler which we own
+    if (ui::initialize(&action_handler_)) {
         initialized_ = true;
         msg("Structor %s: Plugin initialized (hotkey: %s)\n",
             PLUGIN_VERSION, Config::instance().hotkey());
@@ -157,7 +159,7 @@ void StructorPlugin::cleanup() {
     unregister_idc_funcs();
 
     if (initialized_) {
-        UIIntegration::instance().shutdown();
+        ui::shutdown();
 
         // Save configuration if dirty
         if (Config::instance().is_dirty()) {
@@ -197,11 +199,11 @@ bool StructorPlugin::run(size_t arg) {
     }
 
     // Execute synthesis
-    SynthResult result = UIIntegration::instance().execute_synthesis(vdui);
+    SynthResult result = ui::execute_synthesis(vdui);
 
     if (result.success()) {
         if (Config::instance().interactive_mode()) {
-            UIIntegration::instance().show_result_dialog(result);
+            ui::show_result_dialog(result);
         }
     } else {
         qstring errmsg;
