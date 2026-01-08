@@ -535,6 +535,8 @@ clang -g -O0 -o test_simple integration_tests/test_simple_struct.c
 
 ## Relationship to Suture
 
+> fun fact, structor only exists because I wanted to peer pressure @libtero into publishing Suture to GitHub ... with success!
+
 Structor incorporates design patterns and concepts from the [Suture](https://github.com/libtero/suture) project, a Python-based declarative AST pattern matching framework for Hex-Rays:
 
 | Adopted Concept | Description |
