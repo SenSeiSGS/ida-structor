@@ -30,7 +30,9 @@ Structor is an IDA Pro plugin that automatically synthesizes C structure definit
   - [Scripted Mode](#scripted-mode)
   - [Programmatic API](#programmatic-api)
 - [How It Works](#how-it-works)
+  - [Synthesis Pipeline](#synthesis-pipeline)
   - [Z3 Constraint-Based Synthesis](#z3-constraint-based-synthesis)
+  - [Type Inference System](#type-inference-system)
   - [Cross-Function Analysis](#cross-function-analysis)
   - [Array Detection](#array-detection)
   - [Union Handling](#union-handling)
@@ -39,9 +41,9 @@ Structor is an IDA Pro plugin that automatically synthesizes C structure definit
 - [API Reference](#api-reference)
 - [Building from Source](#building-from-source)
 - [Testing](#testing)
+- [Architecture](#architecture)
 - [Relationship to Suture](#relationship-to-suture)
 - [Known Limitations](#known-limitations)
-- [Architecture](#architecture)
 - [License](#license)
 
 ---
@@ -97,7 +99,7 @@ Reverse engineering structures manually is tedious and error-prone:
 4. **VTables are Complex**: C++ virtual function tables involve multiple levels of pointer indirection
 5. **Field Overlaps and Alignment**: Handling unions, padding, and alignment manually is tedious
 
-Structor automates this entire process by analyzing how pointers are dereferenced and synthesizing matching structure definitions using a Z3-based constraint solver.
+Structor automates this entire process by analyzing how pointers are dereferenced and synthesizing matching structure definitions using a Z3-based constraint solver with advanced type inference.
 
 ---
 
@@ -108,6 +110,8 @@ Structor automates this entire process by analyzing how pointers are dereference
 | Feature | Description |
 |---------|-------------|
 | **Z3-Based Constraint Synthesis** | Uses the Z3 SMT solver with Max-SMT optimization for optimal field layout |
+| **Type Inference Engine** | Full type lattice with subtyping, LUB/GLB, and constraint-based inference |
+| **Alias Analysis** | Steensgaard (fast) and Andersen (precise) algorithms for pointer tracking |
 | **Cross-Function Analysis** | Traces type flow across function boundaries with pointer delta tracking |
 | **Automatic Array Detection** | Recognizes arithmetic progressions and synthesizes array fields |
 | **Union Type Creation** | Handles overlapping accesses by creating C union types |
@@ -115,6 +119,17 @@ Structor automates this entire process by analyzing how pointers are dereference
 | **Type Propagation** | Propagates synthesized types to callers and callees across the call graph |
 | **Tiered Fallback** | Falls back gracefully from Z3 to heuristics when constraints fail |
 | **Predicate Filtering** | Allows filtering accesses before synthesis (e.g., only function pointers) |
+
+### Type Inference Features
+
+| Feature | Description |
+|---------|-------------|
+| **Recursive Type System** | Supports base types, pointers, functions, arrays, structs, and sum types |
+| **Signedness Inference** | Detects signed vs unsigned from comparison patterns (`slt` vs `ult`) |
+| **Pointer/Integer Discrimination** | Soft constraints distinguish pointers from integers of same size |
+| **Polymorphic Function Detection** | Recognizes `memcpy`, `qsort`, and similar patterns |
+| **Calling Convention Detection** | Infers calling conventions from register usage patterns |
+| **Bitvector Type Encoding** | Fast 32-bit bitvector encoding for improved solver performance |
 
 ### User Interface
 
@@ -136,7 +151,7 @@ Structor automates this entire process by analyzing how pointers are dereference
 - **IDA Pro 8.0+** with a valid license
 - **Hex-Rays Decompiler** (x86/x64/ARM)
 - **Operating System**: Windows, macOS (Intel/Apple Silicon), or Linux
-- **Z3 Theorem Prover**: Bundled with the plugin or system-installed
+- **Z3 Theorem Prover 4.8+**: Bundled with the plugin or system-installed
 
 ---
 
@@ -158,7 +173,12 @@ Structor automates this entire process by analyzing how pointers are dereference
    copy structor64.dll "%APPDATA%\Hex-Rays\IDA Pro\plugins\"
    ```
 
-3. Restart IDA Pro. The plugin loads automatically.
+3. On macOS, code-sign the plugin:
+   ```bash
+   codesign -s - -f ~/.idapro/plugins/structor64.dylib
+   ```
+
+4. Restart IDA Pro. The plugin loads automatically.
 
 ### From Source
 
@@ -177,10 +197,12 @@ See [Building from Source](#building-from-source) below.
 
 The plugin will:
 - Analyze all dereferences of the selected variable
+- Extract type constraints from instruction semantics
+- Run alias analysis to track pointer relationships
 - Trace type flow across function boundaries (if cross-function analysis is enabled)
 - Use Z3 to find the optimal field layout satisfying all constraints
+- Infer precise field types using the type lattice
 - Create a structure with fields at the detected offsets
-- Infer field types from access sizes and usage patterns
 - Detect and create array fields where applicable
 - Apply the structure type to the variable
 - Refresh the decompiler view with the new types
@@ -241,6 +263,10 @@ opts.z3.mode = structor::Z3SynthesisMode::Preferred;
 opts.z3.cross_function = true;
 opts.z3.detect_arrays = true;
 
+// Enable type inference
+opts.use_type_inference = true;
+opts.apply_inferred_types = true;
+
 structor::SynthResult result =
     structor::StructorAPI::instance().synthesize_structure(
         func_ea, var_idx, &opts);
@@ -268,19 +294,29 @@ if (result.success()) {
 
 ## How It Works
 
-Structor operates as a multi-stage pipeline with Z3-based constraint solving at its core:
+### Synthesis Pipeline
+
+Structor operates as a multi-stage pipeline with Z3-based constraint solving and type inference at its core:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Structor Synthesis Pipeline                     │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Structor Synthesis Pipeline                         │
+└─────────────────────────────────────────────────────────────────────────────┘
 
    ┌──────────────┐    ┌──────────────────┐    ┌─────────────────────────┐
    │   Hex-Rays   │───▶│ AccessCollector  │───▶│ CrossFunctionAnalyzer   │
    │   Decompiler │    │ (ctree visitor)  │    │ (type equivalence class)│
    └──────────────┘    └──────────────────┘    └─────────────────────────┘
-                                                          │
-         ┌────────────────────────────────────────────────┘
+                                                           │
+         ┌─────────────────────────────────────────────────┘
+         ▼
+   ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────┐
+   │ InstructionSemantics│───▶│   AliasAnalyzer     │───▶│ TypeInference   │
+   │   Extractor         │    │ (Steensgaard/       │    │    Engine       │
+   │ (type constraints)  │    │  Andersen)          │    │ (7-phase solve) │
+   └─────────────────────┘    └─────────────────────┘    └─────────────────┘
+                                                                │
+         ┌──────────────────────────────────────────────────────┘
          ▼
    ┌────────────────────┐    ┌─────────────────────┐    ┌─────────────────┐
    │FieldCandidateGen   │───▶│ Z3 LayoutConstraint │───▶│   Max-SMT       │
@@ -296,10 +332,10 @@ Structor operates as a multi-stage pipeline with Z3-based constraint solving at 
                                                             │
          ┌──────────────────────────────────────────────────┘
          ▼
-   ┌───────────────────┐
-   │PseudocodeRewriter │
-   │  (refreshes view) │
-   └───────────────────┘
+   ┌───────────────────┐    ┌───────────────────┐
+   │  TypeApplicator   │───▶│PseudocodeRewriter │
+   │ (apply to IDA)    │    │  (refreshes view) │
+   └───────────────────┘    └───────────────────┘
 ```
 
 ### Stage 1: Access Collection
@@ -342,6 +378,155 @@ weight_alignment = 5;            // Soft: prefer aligned fields
 weight_minimize_fields = 2;      // Soft: prefer fewer fields
 weight_minimize_padding = 1;     // Soft: prefer compact layout
 weight_prefer_arrays = 3;        // Soft: prefer array detection
+```
+
+### Type Inference System
+
+Structor includes a comprehensive type inference system that goes beyond simple size-based field typing. The system uses a formal type lattice with constraint-based solving to infer precise types.
+
+#### Type Lattice
+
+The type system is built on a recursive `InferredType` representation:
+
+```cpp
+enum class Kind {
+    Base,       // Scalar base type (int8, int32, float, etc.)
+    Pointer,    // Pointer to another type
+    Function,   // Function type (return + params)
+    Array,      // Array type (element + count)
+    Struct,     // Structure type (tid-based)
+    Sum         // Sum type for unions (multiple alternatives)
+};
+```
+
+The `TypeLattice` class implements subtyping relationships with lattice operations:
+
+| Operation | Description |
+|-----------|-------------|
+| `is_subtype(a, b)` | Check if type `a` is a subtype of `b` |
+| `lub(a, b)` | Least upper bound (join) - most general common supertype |
+| `glb(a, b)` | Greatest lower bound (meet) - most specific common subtype |
+| `are_compatible(a, b)` | Check if types can coexist at same location |
+| `widen_to_size(t, n)` | Widen type to target byte size |
+
+**Subtyping Rules:**
+- `int8 <: int16 <: int32 <: int64` (signed widening)
+- `uint8 <: uint16 <: uint32 <: uint64` (unsigned widening)
+- `Bottom <: T <: Unknown` for all types T
+- Pointer subtyping is covariant in pointee type
+- Function subtyping is contravariant in parameters, covariant in return
+
+#### Type Constraint Extraction
+
+The `InstructionSemanticsExtractor` walks the Hex-Rays ctree to extract type constraints:
+
+| Instruction Pattern | Generated Constraint |
+|--------------------|---------------------|
+| `x = y` | `TypeConstraint::Equal(type(x), type(y))` |
+| `x < y` (signed) | `TypeConstraint::IsSigned(type(x))`, `TypeConstraint::IsSigned(type(y))` |
+| `x < y` (unsigned) | `TypeConstraint::IsUnsigned(type(x))`, `TypeConstraint::IsUnsigned(type(y))` |
+| `*p` | `TypeConstraint::IsPointer(type(p))` |
+| `p + n` | `TypeConstraint::IsPointer(type(p))` or `TypeConstraint::IsInteger(type(p))` |
+| `(T)x` | `TypeConstraint::Cast(type(x), T)` |
+| `f(a, b)` | Constraints from function signature |
+| `p->field` | `TypeConstraint::HasField(type(p), offset, field_type)` |
+| `arr[i]` | `TypeConstraint::IsArray(type(arr))` |
+
+#### Alias Analysis
+
+Two alias analysis algorithms are available for tracking pointer relationships:
+
+**Steensgaard's Algorithm** (fast, O(n·α(n))):
+- Unification-based analysis
+- May-alias approximation
+- Best for large functions
+
+**Andersen's Algorithm** (precise, O(n³)):
+- Inclusion-based analysis  
+- Flow-insensitive but more precise
+- Better for complex pointer patterns
+
+```cpp
+// Configure alias analysis
+opts.alias_analysis.algorithm = AliasAlgorithm::Steensgaard;  // or Andersen
+opts.alias_analysis.max_iterations = 1000;
+opts.alias_analysis.track_fields = true;
+```
+
+#### Type Inference Engine
+
+The `TypeInferenceEngine` orchestrates a 7-phase inference pipeline:
+
+1. **Constraint Extraction**: Walk ctree, extract type constraints from operations
+2. **Alias Analysis**: Run Steensgaard or Andersen to find pointer equivalences
+3. **Constraint Augmentation**: Add alias-derived equality constraints
+4. **Soft Constraint Generation**: Add heuristic constraints (pointer vs int discrimination)
+5. **Z3 Encoding**: Encode constraints into Z3 expressions with weights
+6. **Max-SMT Solving**: Solve for optimal type assignment
+7. **Model Extraction**: Extract inferred types from Z3 model
+
+```cpp
+// Type inference configuration
+struct TypeInferenceConfig {
+    bool enable_signedness_inference = true;
+    bool enable_pointer_discrimination = true;
+    bool enable_polymorphic_detection = true;
+    bool enable_calling_convention_detection = true;
+    
+    AliasAlgorithm alias_algorithm = AliasAlgorithm::Steensgaard;
+    
+    uint32_t min_confidence = 50;  // Minimum confidence threshold (0-100)
+    uint32_t z3_timeout_ms = 5000;
+    
+    // Soft constraint weights for pointer vs integer heuristics
+    uint32_t weight_pointer_alignment = 10;
+    uint32_t weight_small_constant_is_int = 5;
+    uint32_t weight_arithmetic_result_is_int = 8;
+};
+```
+
+#### Type Encodings for Z3
+
+Two encoding strategies are available:
+
+**Integer Encoding** (default):
+- Types encoded as integers with bit-packed fields
+- Bits 0-7: Type kind tag
+- Bits 8-15: Base type enum value
+- Bits 16-23: Pointer depth / array count
+- Uses arithmetic operations (mod, div) for constraints
+
+**Bitvector Encoding** (faster):
+- Types encoded as 32-bit bitvectors
+- Native bitwise operations
+- Better solver performance for large constraint sets
+
+```cpp
+// Encoding scheme for BitvectorTypeEncoder
+// Bits 0-5:   Base type tag (0-63)
+// Bits 6-13:  Size in bytes (0-255)  
+// Bit  14:    Is pointer flag
+// Bit  15:    Is signed flag
+// Bits 16-23: Pointer depth (0-255)
+// Bits 24-31: Reserved
+```
+
+#### Type Application
+
+The `TypeApplicator` applies inferred types back to IDA:
+
+```cpp
+TypeApplicationConfig config;
+config.min_confidence = 50;           // Only apply types with >= 50% confidence
+config.overwrite_existing = false;    // Don't replace existing typed variables
+config.propagate_to_callers = true;   // Update caller functions
+config.propagate_to_callees = true;   // Update callee functions
+
+TypeApplicator applicator(config);
+auto result = applicator.apply(cfunc, inference_result);
+
+msg("Applied %u types, failed %u, skipped %u\n",
+    result.types_applied, result.types_failed, result.types_skipped);
 ```
 
 ### Cross-Function Analysis
@@ -439,6 +624,8 @@ union {
 } field_10;
 ```
 
+The type inference system represents these as `InferredType::Sum` types.
+
 ### Fallback Strategies
 
 Structor employs a tiered fallback system:
@@ -455,47 +642,6 @@ bool relax_types_on_unsat = true;
 bool use_raw_bytes_fallback = true;
 bool fallback_to_heuristics = true;
 ```
-
-### Stage 2: Layout Synthesis
-
-The `LayoutSynthesizer` processes collected accesses:
-
-1. Generates field candidates from access patterns
-2. Builds Z3 constraints for coverage, alignment, and type consistency
-3. Solves using Max-SMT for optimal layout
-4. Handles array detection and union creation
-5. Falls back to heuristics if Z3 fails
-
-### Stage 3: VTable Detection
-
-The `VTableDetector` identifies C++ virtual table patterns:
-
-- Offset 0 access followed by indexed indirect call
-- Multiple function pointer accesses through same base
-- Call patterns matching virtual dispatch semantics
-
-When detected, a separate vtable structure is created with function pointer slots.
-
-### Stage 4: Structure Persistence
-
-The `StructurePersistence` component creates the structure in IDA's type system:
-
-- Creates a new struct in Local Types
-- Adds fields with inferred types
-- Sets appropriate alignment
-- Links vtable structures if detected
-
-### Stage 5: Type Propagation
-
-The `TypePropagator` spreads the new type through the codebase:
-
-- **Backward**: Callers that pass the variable as an argument
-- **Forward**: Callees that receive it as a parameter
-- **Local**: Aliased variables within the same function
-
-### Stage 6: Pseudocode Refresh
-
-The `PseudocodeRewriter` updates the decompiler view to reflect the new types, transforming pointer arithmetic into clean member access notation.
 
 ---
 
@@ -542,6 +688,16 @@ z3_allow_unions=true        # Allow union type creation for conflicts
 z3_min_confidence=20        # Minimum confidence threshold (0-100)
 z3_relax_on_unsat=true      # Relax constraints if UNSAT
 z3_max_relax_iterations=5   # Maximum relaxation iterations
+
+[TypeInference]
+enable_type_inference=true          # Enable advanced type inference
+apply_inferred_types=true           # Apply inferred types to IDA
+enable_signedness_inference=true    # Infer signed vs unsigned
+enable_pointer_discrimination=true  # Distinguish pointers from integers
+enable_polymorphic_detection=true   # Detect polymorphic functions
+alias_algorithm=steensgaard         # Alias analysis: steensgaard or andersen
+type_encoding=integer               # Type encoding: integer or bitvector
+min_type_confidence=50              # Minimum confidence for type application
 ```
 
 The config file is created automatically with defaults on first run if it doesn't exist.
@@ -553,6 +709,13 @@ The config file is created automatically with defaults on first run if it doesn'
 | `disabled` | Use heuristic-only synthesis (original behavior) |
 | `preferred` | Try Z3 first, fall back to heuristics on failure |
 | `required` | Z3 only, fail if Z3 fails |
+
+### Alias Analysis Algorithms
+
+| Algorithm | Complexity | Precision | Use Case |
+|-----------|------------|-----------|----------|
+| `steensgaard` | O(n·α(n)) | Lower | Large functions, quick analysis |
+| `andersen` | O(n³) | Higher | Complex pointer patterns, precise results |
 
 ### Predicate-Based Filtering
 
@@ -615,6 +778,7 @@ opts.access_filter = structor::predicates::all_of({
 | "Failed to create struct type" | IDA type system error |
 | "Z3 solver timed out" | Z3 exceeded configured timeout |
 | "Z3 constraints unsatisfiable" | No valid layout satisfies all hard constraints |
+| "Type inference failed" | Type inference engine couldn't solve constraints |
 
 ---
 
@@ -683,6 +847,7 @@ make -j$(nproc)
 | `IDA_INSTALL_DIR` | - | Path to IDA installation (for install target) |
 | `IDA_EA64` | `ON` | Build for 64-bit IDA (`ida64`) |
 | `BUILD_TESTS` | `OFF` | Build unit tests |
+| `Z3_USE_SYSTEM` | `ON` | Use system-installed Z3 |
 | `CMAKE_BUILD_TYPE` | `Release` | Build type (`Release`/`Debug`) |
 
 ### Platform-Specific Output
@@ -713,11 +878,23 @@ ctest --output-on-failure
 | Test Suite | Description |
 |------------|-------------|
 | `test_z3_context` | Z3 context creation and configuration |
-| `test_type_encoding` | IDA type to Z3 type encoding |
-| `test_layout_constraints` | Constraint building and solving |
-| `test_array_detection` | Arithmetic progression and array synthesis |
-| `test_cross_function` | Cross-function analysis and delta tracking |
+| `test_z3_type_encoding` | IDA type to Z3 type encoding |
+| `test_z3_layout_constraints` | Constraint building and solving |
+| `test_z3_array_detection` | Arithmetic progression and array synthesis |
+| `test_z3_cross_function` | Cross-function analysis and delta tracking |
+| `test_z3_synthesis_integration` | Z3 synthesis integration scenarios |
 | `test_e2e_synthesis` | End-to-end synthesis scenarios |
+| `test_type_lattice` | Type lattice operations (31 sub-tests) |
+
+The `test_type_lattice` suite covers:
+- Base type utilities (names, sizes, classification)
+- `InferredType` construction (base, pointer, function, array, struct, sum)
+- Pointer depth tracking
+- Type equality and hashing
+- `TypeLattice` subtyping relations
+- LUB/GLB operations
+- `TypeLatticeEncoder` Z3 integration
+- `BitvectorTypeEncoder` encode/decode
 
 ### Integration Tests
 
@@ -741,6 +918,109 @@ clang -g -O0 -o test_simple integration_tests/test_simple_struct.c
 
 # Load in IDA, navigate to process_simple(), run Structor
 ```
+
+---
+
+## Architecture
+
+### Core Data Types
+
+| Type | Purpose |
+|------|---------|
+| `FieldAccess` | Single observed memory access (offset, size, type) |
+| `AccessPattern` | Collection of accesses for a variable |
+| `UnifiedAccessPattern` | Merged pattern from cross-function analysis |
+| `FieldCandidate` | Candidate field for Z3 constraint solving |
+| `SynthField` | Synthesized field definition |
+| `SynthStruct` | Complete synthesized structure |
+| `SynthVTable` | Synthesized vtable with function pointer slots |
+| `SynthResult` | Result of synthesis operation with Z3 details |
+
+### Z3 Module Components
+
+| Component | Purpose |
+|-----------|---------|
+| `Z3Context` | RAII wrapper for Z3 context with Structor configuration |
+| `TypeEncoder` | Encodes IDA types to Z3 expressions |
+| `FieldCandidateGenerator` | Generates candidate fields from accesses |
+| `ArrayConstraintBuilder` | Detects and encodes array patterns |
+| `LayoutConstraintBuilder` | Builds and solves layout constraints |
+| `ConstraintTracker` | Tracks constraint provenance for debugging |
+
+### Type Inference Components
+
+| Component | Purpose |
+|-----------|---------|
+| `InferredType` | Recursive type representation (base, pointer, function, array, struct, sum) |
+| `TypeLattice` | Subtyping with LUB/GLB operations |
+| `TypeLatticeEncoder` | Encodes `InferredType` to Z3 integer expressions |
+| `BitvectorTypeEncoder` | Fast 32-bit bitvector encoding for Z3 |
+| `TypeVariable` | Represents unknown types for variables/memory |
+| `TypeConstraint` | Constraint types (Equal, Subtype, IsBase, IsPointer, IsSigned, etc.) |
+| `InstructionSemanticsExtractor` | Extracts type constraints from Hex-Rays ctree |
+| `SignednessInferrer` | Infers signedness from comparison patterns |
+| `PointerIntegerDiscriminator` | Soft constraint heuristics for pointer vs integer |
+| `AbstractLocation` | Memory location representation (stack, heap, global, parameter) |
+| `SteensgaardAliasAnalyzer` | Fast unification-based alias analysis O(n·α(n)) |
+| `AndersenAliasAnalyzer` | Precise inclusion-based alias analysis O(n³) |
+| `AliasAnalyzer` | Unified interface selecting algorithm based on config |
+| `TypeInferenceEngine` | Main orchestrator implementing 7-phase pipeline |
+| `TypeApplicator` | Applies inferred types to IDA decompiler |
+| `PolymorphicFunctionDetector` | Detects memcpy, qsort-like patterns |
+| `CallingConventionDetector` | Infers calling conventions from register usage |
+
+### Base Type Hierarchy
+
+```
+BaseType
+├── Unknown      (top)
+├── Bottom       (contradiction)
+├── Signed Integers
+│   ├── Int8
+│   ├── Int16
+│   ├── Int32
+│   └── Int64
+├── Unsigned Integers
+│   ├── UInt8
+│   ├── UInt16
+│   ├── UInt32
+│   └── UInt64
+├── Floating Point
+│   ├── Float32
+│   └── Float64
+└── Special
+    ├── Void
+    └── Bool
+```
+
+### Type Resolution Priority
+
+When multiple accesses target the same offset with different types, the more specific type wins:
+
+| Semantic Type | Priority |
+|---------------|----------|
+| VTablePointer | 100 |
+| FunctionPointer | 90 |
+| NestedStruct | 85 |
+| Pointer | 80 |
+| Double | 70 |
+| Float | 65 |
+| Array | 60 |
+| UnsignedInteger | 50 |
+| Integer | 40 |
+| Padding | 10 |
+| Unknown | 0 |
+
+### Cross-Function Analysis Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `max_depth` | 5 | Maximum call graph traversal depth |
+| `follow_forward` | true | Follow caller → callee (parameter passing) |
+| `follow_backward` | true | Follow callee → caller (return values) |
+| `max_functions` | 100 | Maximum functions to analyze |
+| `include_indirect_calls` | false | Include indirect/virtual calls |
+| `track_pointer_deltas` | true | Track ptr+const adjustments |
 
 ---
 
@@ -780,7 +1060,7 @@ void example(void* ptr) {
 }
 ```
 
-**Workaround**: Run synthesis on the aliased variable (`temp`) instead, or enable cross-function analysis which may detect the alias.
+**Workaround**: Run synthesis on the aliased variable (`temp`) instead, or enable cross-function analysis which may detect the alias. The alias analysis in the type inference engine can also help connect aliased variables.
 
 ### Computed Array Indices
 
@@ -809,62 +1089,11 @@ The vtable slot accesses are on `vtable`, not `obj`, so they're not counted towa
 - Maximum structure size: 64 KB
 - Maximum field candidates: 1000
 
----
+### Type Inference Limitations
 
-## Architecture
-
-### Core Data Types
-
-| Type | Purpose |
-|------|---------|
-| `FieldAccess` | Single observed memory access (offset, size, type) |
-| `AccessPattern` | Collection of accesses for a variable |
-| `UnifiedAccessPattern` | Merged pattern from cross-function analysis |
-| `FieldCandidate` | Candidate field for Z3 constraint solving |
-| `SynthField` | Synthesized field definition |
-| `SynthStruct` | Complete synthesized structure |
-| `SynthVTable` | Synthesized vtable with function pointer slots |
-| `SynthResult` | Result of synthesis operation with Z3 details |
-
-### Z3 Module Components
-
-| Component | Purpose |
-|-----------|---------|
-| `Z3Context` | RAII wrapper for Z3 context with Structor configuration |
-| `TypeEncoder` | Encodes IDA types to Z3 expressions |
-| `FieldCandidateGenerator` | Generates candidate fields from accesses |
-| `ArrayConstraintBuilder` | Detects and encodes array patterns |
-| `LayoutConstraintBuilder` | Builds and solves layout constraints |
-| `ConstraintTracker` | Tracks constraint provenance for debugging |
-
-### Type Resolution Priority
-
-When multiple accesses target the same offset with different types, the more specific type wins:
-
-| Semantic Type | Priority |
-|---------------|----------|
-| VTablePointer | 100 |
-| FunctionPointer | 90 |
-| NestedStruct | 85 |
-| Pointer | 80 |
-| Double | 70 |
-| Float | 65 |
-| Array | 60 |
-| UnsignedInteger | 50 |
-| Integer | 40 |
-| Padding | 10 |
-| Unknown | 0 |
-
-### Cross-Function Analysis Configuration
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `max_depth` | 5 | Maximum call graph traversal depth |
-| `follow_forward` | true | Follow caller → callee (parameter passing) |
-| `follow_backward` | true | Follow callee → caller (return values) |
-| `max_functions` | 100 | Maximum functions to analyze |
-| `include_indirect_calls` | false | Include indirect/virtual calls |
-| `track_pointer_deltas` | true | Track ptr+const adjustments |
+- Polymorphic function detection is heuristic-based
+- Complex indirect call patterns may not propagate types correctly
+- Sum types (unions) lose some precision when converted to IDA types
 
 ---
 
