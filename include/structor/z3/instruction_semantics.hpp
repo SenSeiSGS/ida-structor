@@ -1,0 +1,388 @@
+#pragma once
+
+#include <z3++.h>
+#include "structor/z3/type_lattice.hpp"
+#include "structor/z3/context.hpp"
+#include "structor/synth_types.hpp"
+
+#ifndef STRUCTOR_TESTING
+#include <hexrays.hpp>
+#endif
+
+#include <optional>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace structor::z3 {
+
+// Forward declarations
+class TypeConstraintSet;
+
+/// A type variable representing an unknown type to be inferred
+struct TypeVariable {
+    int id;                      // Unique identifier
+    ea_t func_ea;                // Function containing this variable
+    int var_idx;                 // Local variable index (-1 if not a local var)
+    int ssa_version;             // SSA version for flow-sensitivity
+    qstring name;                // Human-readable name
+    
+    // Location info for memory variables
+    std::optional<ea_t> mem_base;
+    std::optional<sval_t> mem_offset;
+    std::optional<uint32_t> mem_size;
+    
+    TypeVariable() : id(-1), func_ea(BADADDR), var_idx(-1), ssa_version(0) {}
+    
+    /// Create a type variable for a local variable
+    static TypeVariable for_local(int id, ea_t func_ea, int var_idx, int version = 0);
+    
+    /// Create a type variable for a memory location
+    static TypeVariable for_memory(int id, ea_t base, sval_t offset, uint32_t size);
+    
+    /// Create a type variable for a temporary expression
+    static TypeVariable for_temp(int id, ea_t func_ea, const char* name);
+    
+    [[nodiscard]] bool is_local() const noexcept { return var_idx >= 0; }
+    [[nodiscard]] bool is_memory() const noexcept { return mem_base.has_value(); }
+    [[nodiscard]] bool is_temp() const noexcept { return !is_local() && !is_memory(); }
+    
+    bool operator==(const TypeVariable& other) const noexcept {
+        return id == other.id;
+    }
+};
+
+/// Hash for TypeVariable
+struct TypeVariableHash {
+    std::size_t operator()(const TypeVariable& tv) const noexcept {
+        return std::hash<int>{}(tv.id);
+    }
+};
+
+/// A type constraint relating one or more type variables
+struct TypeConstraint {
+    enum class Kind {
+        // Equality constraints
+        Equal,              // t1 == t2
+        
+        // Subtyping constraints
+        Subtype,            // t1 <: t2 (t1 is subtype of t2)
+        
+        // Concrete type constraints
+        IsBase,             // t == base_type
+        IsPointer,          // t is some pointer type
+        IsPointerTo,        // t == ptr(pointee_type)
+        IsInteger,          // t is some integer type
+        IsSigned,           // t is a signed integer
+        IsUnsigned,         // t is an unsigned integer
+        IsFloating,         // t is floating point
+        
+        // Size constraints
+        HasSize,            // size(t) == n bytes
+        
+        // Disjunctive constraints
+        OneOf,              // t in {t1, t2, ...}
+        
+        // Implication constraints (for path sensitivity)
+        Implies,            // condition => constraint
+    };
+    
+    Kind kind;
+    TypeVariable var1;                           // Primary type variable
+    std::optional<TypeVariable> var2;            // Secondary type variable (for Equal, Subtype)
+    std::optional<InferredType> concrete_type;   // For IsBase, IsPointerTo, OneOf
+    std::optional<uint32_t> size;                // For HasSize
+    std::vector<InferredType> alternatives;      // For OneOf
+    
+    // Source tracking
+    ea_t source_ea = BADADDR;
+    qstring description;
+    
+    // Soft constraint info
+    bool is_soft = false;
+    int weight = 0;
+    
+    TypeConstraint() : kind(Kind::Equal) {}
+    
+    /// Factory methods
+    static TypeConstraint make_equal(TypeVariable t1, TypeVariable t2, ea_t ea = BADADDR);
+    static TypeConstraint make_subtype(TypeVariable sub, TypeVariable sup, ea_t ea = BADADDR);
+    static TypeConstraint make_is_base(TypeVariable t, BaseType base, ea_t ea = BADADDR);
+    static TypeConstraint make_is_pointer(TypeVariable t, ea_t ea = BADADDR);
+    static TypeConstraint make_is_pointer_to(TypeVariable t, InferredType pointee, ea_t ea = BADADDR);
+    static TypeConstraint make_is_integer(TypeVariable t, ea_t ea = BADADDR);
+    static TypeConstraint make_is_signed(TypeVariable t, ea_t ea = BADADDR);
+    static TypeConstraint make_is_unsigned(TypeVariable t, ea_t ea = BADADDR);
+    static TypeConstraint make_is_floating(TypeVariable t, ea_t ea = BADADDR);
+    static TypeConstraint make_has_size(TypeVariable t, uint32_t size, ea_t ea = BADADDR);
+    static TypeConstraint make_one_of(TypeVariable t, std::vector<InferredType> types, ea_t ea = BADADDR);
+    
+    /// Set as soft constraint with weight
+    TypeConstraint& soft(int w) {
+        is_soft = true;
+        weight = w;
+        return *this;
+    }
+    
+    /// Add description
+    TypeConstraint& describe(const char* desc) {
+        description = desc;
+        return *this;
+    }
+};
+
+/// Configuration for instruction semantics extraction
+struct InstructionSemanticsConfig {
+    bool extract_from_comparisons = true;    // Infer signedness from cmp patterns
+    bool extract_from_casts = true;          // Extract constraints from type casts
+    bool extract_from_arithmetic = true;     // Analyze arithmetic for int/float
+    bool extract_from_memory_ops = true;     // Analyze pointer dereferences
+    bool extract_from_calls = true;          // Use function signatures
+    bool track_ssa_versions = true;          // Flow-sensitive analysis
+    bool generate_soft_constraints = true;   // Generate preference constraints
+    
+    // Soft constraint weights
+    int weight_from_decompiler = 10;         // Type from Hex-Rays
+    int weight_from_signature = 20;          // Type from function signature
+    int weight_signed_preference = 5;        // Prefer signed over unsigned
+    int weight_pointer_for_mem_base = 15;    // Memory base -> likely pointer
+    int weight_int_for_small_const = 5;      // Small constant comparison -> int
+};
+
+/// Collects type constraints from ctree expressions
+class InstructionSemanticsExtractor {
+public:
+    InstructionSemanticsExtractor(
+        Z3Context& ctx,
+        const InstructionSemanticsConfig& config = {}
+    );
+    
+    /// Extract all type constraints from a function's ctree
+    [[nodiscard]] TypeConstraintSet extract(cfunc_t* cfunc);
+    
+    /// Extract constraints for a specific expression
+    [[nodiscard]] qvector<TypeConstraint> extract_expr(cexpr_t* expr, cfunc_t* cfunc);
+    
+    /// Get or create type variable for a local variable
+    [[nodiscard]] TypeVariable get_var_type(cfunc_t* cfunc, int var_idx, int version = 0);
+    
+    /// Get or create type variable for a memory location
+    [[nodiscard]] TypeVariable get_mem_type(ea_t base, sval_t offset, uint32_t size);
+    
+    /// Get or create type variable for a temporary expression
+    [[nodiscard]] TypeVariable get_temp_type(ea_t func_ea, const char* name);
+    
+    /// Get the type encoder
+    [[nodiscard]] TypeLatticeEncoder& type_encoder() noexcept { return encoder_; }
+    
+    /// Get statistics
+    struct Stats {
+        int constraints_extracted = 0;
+        int hard_constraints = 0;
+        int soft_constraints = 0;
+        int type_variables = 0;
+        int expressions_analyzed = 0;
+    };
+    [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+
+private:
+    Z3Context& ctx_;
+    TypeLatticeEncoder encoder_;
+    InstructionSemanticsConfig config_;
+    Stats stats_;
+    
+    // Type variable management
+    int next_var_id_ = 0;
+    std::unordered_map<int, std::unordered_map<int, TypeVariable>> local_vars_;  // func -> var_idx -> TypeVar
+    std::unordered_map<std::size_t, TypeVariable> mem_vars_;                     // hash -> TypeVar
+    std::unordered_map<std::size_t, TypeVariable> temp_vars_;                    // hash -> TypeVar
+    
+    // Current function being analyzed
+    cfunc_t* current_cfunc_ = nullptr;
+    ea_t current_func_ea_ = BADADDR;
+    
+    /// Analyze a specific ctree node
+    void analyze_node(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    
+    /// Extract constraints from different expression types
+    void extract_from_assignment(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_ptr_deref(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_comparison(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_arithmetic(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_cast(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_call(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_array_access(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    void extract_from_member_access(cexpr_t* expr, qvector<TypeConstraint>& constraints);
+    
+    /// Infer type from expression's decompiler type
+    [[nodiscard]] std::optional<InferredType> infer_from_tinfo(const tinfo_t& type);
+    
+    /// Get type variable for an expression (creates temp if needed)
+    [[nodiscard]] TypeVariable get_expr_type(cexpr_t* expr);
+    
+    /// Check if comparison uses signed semantics (jl/jg vs jb/ja)
+    [[nodiscard]] bool is_signed_comparison(ctype_t cmp_op) const noexcept;
+    
+    /// Check if comparison uses unsigned semantics
+    [[nodiscard]] bool is_unsigned_comparison(ctype_t cmp_op) const noexcept;
+    
+    /// Generate hash for memory location
+    [[nodiscard]] std::size_t hash_mem_location(ea_t base, sval_t offset, uint32_t size) const;
+    
+    /// Generate hash for temp variable
+    [[nodiscard]] std::size_t hash_temp(ea_t func_ea, const char* name) const;
+};
+
+/// Collection of type constraints for solving
+class TypeConstraintSet {
+public:
+    TypeConstraintSet(Z3Context& ctx);
+    
+    /// Add a constraint
+    void add(TypeConstraint constraint);
+    
+    /// Add multiple constraints
+    void add_all(const qvector<TypeConstraint>& constraints);
+    
+    /// Clear all constraints
+    void clear();
+    
+    /// Get all constraints
+    [[nodiscard]] const qvector<TypeConstraint>& constraints() const noexcept {
+        return constraints_;
+    }
+    
+    /// Get all type variables referenced
+    [[nodiscard]] const std::unordered_set<TypeVariable, TypeVariableHash>& variables() const noexcept {
+        return variables_;
+    }
+    
+    /// Convert to Z3 constraints
+    [[nodiscard]] ::z3::expr_vector to_z3_hard(TypeLatticeEncoder& encoder) const;
+    
+    /// Convert soft constraints to Z3 with weights
+    [[nodiscard]] std::vector<std::pair<::z3::expr, int>> to_z3_soft(TypeLatticeEncoder& encoder) const;
+    
+    /// Get Z3 expression for a type variable
+    [[nodiscard]] ::z3::expr get_z3_var(const TypeVariable& tv, TypeLatticeEncoder& encoder) const;
+    
+    /// Get statistics
+    [[nodiscard]] std::size_t hard_count() const noexcept;
+    [[nodiscard]] std::size_t soft_count() const noexcept;
+    [[nodiscard]] std::size_t total_count() const noexcept { return constraints_.size(); }
+
+private:
+    Z3Context& ctx_;
+    qvector<TypeConstraint> constraints_;
+    std::unordered_set<TypeVariable, TypeVariableHash> variables_;
+    
+    mutable std::unordered_map<int, ::z3::expr> var_cache_;  // tv.id -> z3_expr
+    
+    /// Convert a single constraint to Z3
+    [[nodiscard]] ::z3::expr constraint_to_z3(
+        const TypeConstraint& c,
+        TypeLatticeEncoder& encoder
+    ) const;
+};
+
+/// Visitor for extracting constraints from ctree
+class ConstraintExtractionVisitor : public ctree_visitor_t {
+public:
+    ConstraintExtractionVisitor(
+        InstructionSemanticsExtractor& extractor,
+        qvector<TypeConstraint>& constraints
+    );
+    
+    int idaapi visit_expr(cexpr_t* e) override;
+    
+private:
+    InstructionSemanticsExtractor& extractor_;
+    qvector<TypeConstraint>& constraints_;
+};
+
+/// Signedness inference from comparison patterns
+/// Analyzes cmp followed by conditional jump to infer signed/unsigned
+class SignednessInferrer {
+public:
+    SignednessInferrer(Z3Context& ctx);
+    
+    /// Analyze a comparison expression and infer signedness constraints
+    [[nodiscard]] qvector<TypeConstraint> analyze_comparison(
+        cexpr_t* cmp_expr,
+        TypeVariable lhs_type,
+        TypeVariable rhs_type
+    );
+    
+    /// Analyze a conditional expression for signedness hints
+    [[nodiscard]] qvector<TypeConstraint> analyze_conditional(
+        cexpr_t* cond_expr,
+        TypeVariable cond_type
+    );
+    
+    /// Check if an operation implies signed semantics
+    [[nodiscard]] bool implies_signed(ctype_t op) const noexcept;
+    
+    /// Check if an operation implies unsigned semantics
+    [[nodiscard]] bool implies_unsigned(ctype_t op) const noexcept;
+
+private:
+    Z3Context& ctx_;
+};
+
+/// Pointer vs integer discriminator using heuristics
+/// Generates soft constraints preferring pointer or integer based on usage patterns
+class PointerIntegerDiscriminator {
+public:
+    PointerIntegerDiscriminator(Z3Context& ctx);
+    
+    /// Analyze usage of a variable and generate preference constraints
+    [[nodiscard]] qvector<TypeConstraint> analyze_usage(
+        TypeVariable var,
+        const qvector<cexpr_t*>& usage_sites
+    );
+    
+    /// Check if variable is used as memory base
+    [[nodiscard]] bool used_as_memory_base(
+        TypeVariable var,
+        const qvector<cexpr_t*>& usage_sites
+    ) const;
+    
+    /// Check if variable is compared against small constants
+    [[nodiscard]] bool compared_against_small_const(
+        TypeVariable var,
+        const qvector<cexpr_t*>& usage_sites
+    ) const;
+    
+    /// Check if variable comes from malloc/allocation
+    [[nodiscard]] bool from_allocation(
+        TypeVariable var,
+        cfunc_t* cfunc
+    ) const;
+    
+    /// Check if variable is used in arithmetic with large constants
+    [[nodiscard]] bool arithmetic_with_large_const(
+        TypeVariable var,
+        const qvector<cexpr_t*>& usage_sites
+    ) const;
+    
+    /// Get soft constraint weights
+    struct Weights {
+        int memory_base_is_pointer = 15;
+        int small_const_compare_is_int = 10;
+        int from_malloc_is_pointer = 20;
+        int large_const_arithmetic_is_int = 8;
+    };
+    void set_weights(const Weights& w) { weights_ = w; }
+
+private:
+    Z3Context& ctx_;
+    Weights weights_;
+    
+    // Threshold for "small" constant
+    static constexpr int64_t SMALL_CONST_THRESHOLD = 0x10000;
+    
+    // Threshold for "large" constant (likely not pointer arithmetic)
+    static constexpr int64_t LARGE_CONST_THRESHOLD = 0x100000;
+};
+
+} // namespace structor::z3

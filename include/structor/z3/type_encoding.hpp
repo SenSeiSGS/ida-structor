@@ -1,8 +1,14 @@
 #pragma once
 
 #include <z3++.h>
+
+#ifdef STRUCTOR_TESTING
+#include "mock_ida.hpp"
+#else
 #include <pro.h>
 #include <typeinf.hpp>
+#endif
+
 #include "structor/z3/context.hpp"
 #include <optional>
 #include <vector>

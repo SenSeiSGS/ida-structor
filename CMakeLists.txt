@@ -249,6 +249,11 @@ set(STRUCTOR_SOURCES
     src/z3/field_candidates.cpp
     src/z3/array_constraints.cpp
     src/z3/layout_constraints.cpp
+    src/z3/type_lattice.cpp
+    src/z3/instruction_semantics.cpp
+    src/z3/type_inference_engine.cpp
+    src/z3/alias_analysis.cpp
+    src/z3/type_applicator.cpp
     src/cross_function_analyzer.cpp
 )
 
@@ -274,6 +279,11 @@ set(STRUCTOR_HEADERS
     include/structor/z3/array_constraints.hpp
     include/structor/z3/layout_constraints.hpp
     include/structor/z3/test_ir.hpp
+    include/structor/z3/type_lattice.hpp
+    include/structor/z3/instruction_semantics.hpp
+    include/structor/z3/alias_analysis.hpp
+    include/structor/z3/type_inference_engine.hpp
+    include/structor/z3/type_applicator.hpp
 )
 
 # Plugin shared library

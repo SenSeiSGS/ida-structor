@@ -4,10 +4,15 @@
 #include "config.hpp"
 #include "utils.hpp"
 #include "cross_function_analyzer.hpp"
+#include "access_collector.hpp"
+#include "structure_persistence.hpp"
+#include "type_propagator.hpp"
 #include "z3/context.hpp"
 #include "z3/layout_constraints.hpp"
 #include "z3/field_candidates.hpp"
 #include "z3/result.hpp"
+#include "z3/type_inference_engine.hpp"
+#include "z3/type_applicator.hpp"
 #include <memory>
 #include <chrono>
 
@@ -132,6 +137,12 @@ struct LayoutSynthConfig {
     int weight_alignment = 5;
     int weight_minimize_fields = 2;
     int weight_prefer_arrays = 3;
+    
+    // Type inference integration
+    bool use_type_inference = true;        // Use TypeInferenceEngine to improve field types
+    bool apply_inferred_types = true;      // Apply inferred types to decompiler after synthesis
+    z3::TypeInferenceConfig type_inference_config;  // Configuration for type inference
+    z3::TypeApplicationConfig type_application_config;  // Configuration for type application
 };
 
 /// Main layout synthesizer - uses Z3 as primary engine with tiered fallback
@@ -169,11 +180,28 @@ public:
 
     /// Get mutable configuration
     [[nodiscard]] LayoutSynthConfig& mutable_config() noexcept { return config_; }
+    
+    /// Synthesize with type inference - uses TypeInferenceEngine to get better types
+    [[nodiscard]] SynthesisResult synthesize_with_type_inference(
+        cfunc_t* cfunc,
+        int var_idx,
+        const SynthOptions& opts = Config::instance().options()
+    );
+    
+    /// Apply synthesized struct and inferred types to decompiler
+    [[nodiscard]] z3::TypeApplicationResult apply_synthesis_result(
+        cfunc_t* cfunc,
+        int var_idx,
+        const SynthesisResult& result
+    );
 
 private:
     LayoutSynthConfig config_;
     std::unique_ptr<z3::Z3Context> z3_ctx_;
     qvector<AccessConflict> conflicts_;
+    
+    // Type inference results (cached from last synthesis_with_type_inference)
+    std::optional<z3::FunctionTypeInferenceResult> last_type_inference_;
 
     /// Group accesses by offset range (for heuristic fallback)
     struct OffsetGroup {
@@ -879,6 +907,235 @@ inline z3::CandidateGenerationConfig LayoutSynthesizer::make_candidate_config() 
     z3::CandidateGenerationConfig cfg;
     cfg.min_array_elements = config_.min_array_elements;
     return cfg;
+}
+
+inline SynthesisResult LayoutSynthesizer::synthesize_with_type_inference(
+    cfunc_t* cfunc,
+    int var_idx,
+    const SynthOptions& opts)
+{
+    SynthesisResult result;
+    
+    if (!cfunc) {
+        return result;
+    }
+    
+    auto start_time = std::chrono::steady_clock::now();
+    
+    // Step 1: Run type inference if enabled
+    if (config_.use_type_inference) {
+        detail::synth_log("[Structor] Running type inference for function %a...\n", cfunc->entry_ea);
+        
+        // Create Z3 context for type inference
+        z3::Z3Config z3_config = make_z3_config();
+        z3_ctx_ = std::make_unique<z3::Z3Context>(z3_config);
+        
+        // Run type inference
+        z3::TypeInferenceEngine engine(*z3_ctx_, config_.type_inference_config);
+        z3::FunctionTypeInferenceResult infer_result = engine.infer_function(cfunc);
+        
+        if (infer_result.success) {
+            detail::synth_log("[Structor] Type inference completed: %zu variables typed\n",
+                             infer_result.local_types.size());
+            last_type_inference_ = std::move(infer_result);
+        } else {
+            detail::synth_log("[Structor] Type inference failed: %s\n",
+                             infer_result.error_message.c_str());
+        }
+    }
+    
+    // Step 2: Collect access pattern for the variable
+    AccessCollector collector;
+    AccessPattern pattern = collector.collect(cfunc, var_idx);
+    
+    if (pattern.accesses.empty()) {
+        detail::synth_log("[Structor] No accesses found for variable %d\n", var_idx);
+        return result;
+    }
+    
+    // Step 3: Enhance access pattern with type inference results
+    if (last_type_inference_.has_value() && last_type_inference_->success) {
+        // Get inferred type for the target variable
+        auto var_type = last_type_inference_->get_var_type(var_idx);
+        if (var_type.has_value()) {
+            detail::synth_log("[Structor] Using inferred type for variable %d: %s\n",
+                             var_idx, var_type->to_string().c_str());
+            
+            // If it's a pointer type, this confirms our target is a pointer to struct
+            if (var_type->is_pointer()) {
+                // Enhance field accesses with inferred pointee types
+                for (auto& access : pattern.accesses) {
+                    // Check if we have inferred memory type at this offset
+                    auto mem_type = last_type_inference_->get_mem_type(
+                        cfunc->entry_ea, access.offset);
+                    if (mem_type.has_value()) {
+                        // Use inferred type if we don't have a better one
+                        if (access.inferred_type.empty() || access.inferred_type.is_void()) {
+                            access.inferred_type = mem_type->to_tinfo();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Step 4: Run structure synthesis
+    result = synthesize(pattern, opts);
+    
+    // Step 5: Apply type inference results to improve field types
+    if (last_type_inference_.has_value() && last_type_inference_->success) {
+        for (auto& field : result.structure.fields) {
+            if (field.is_padding) continue;
+            
+            // Look for inferred memory type at this field's offset
+            auto mem_type = last_type_inference_->get_mem_type(
+                cfunc->entry_ea, field.offset);
+            if (mem_type.has_value() && !mem_type->is_unknown()) {
+                tinfo_t inferred = mem_type->to_tinfo();
+                
+                // Use inferred type if current type is generic
+                if (field.type.empty() || field.type.is_ptr_or_array()) {
+                    // For pointers, use the more specific type
+                    if (field.type.is_ptr() && inferred.is_ptr()) {
+                        tinfo_t current_pointee = field.type.get_pointed_object();
+                        tinfo_t inferred_pointee = inferred.get_pointed_object();
+                        
+                        // Prefer non-void pointee
+                        if (current_pointee.is_void() && !inferred_pointee.is_void()) {
+                            field.type = inferred;
+                        }
+                    } else if (field.type.empty()) {
+                        field.type = inferred;
+                    }
+                }
+            }
+        }
+    }
+    
+    auto end_time = std::chrono::steady_clock::now();
+    result.synthesis_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time);
+    
+    return result;
+}
+
+inline z3::TypeApplicationResult LayoutSynthesizer::apply_synthesis_result(
+    cfunc_t* cfunc,
+    int var_idx,
+    const SynthesisResult& result)
+{
+    z3::TypeApplicationResult app_result;
+    
+    if (!cfunc || result.structure.fields.empty()) {
+        return app_result;
+    }
+    
+    // Step 1: Create and persist the synthesized structure
+    StructurePersistence persistence;
+    SynthStruct synth_copy = result.structure;  // create_struct may modify the name
+    tid_t struct_tid = persistence.create_struct(synth_copy);
+    
+    if (struct_tid == BADADDR) {
+        detail::synth_log("[Structor] Failed to create structure in IDA\n");
+        return app_result;
+    }
+    
+    detail::synth_log("[Structor] Created structure '%s' with tid %a\n",
+                     synth_copy.name.c_str(), struct_tid);
+    
+    // Step 2: Create pointer type to the struct
+    tinfo_t struct_type;
+    if (!struct_type.get_type_by_tid(struct_tid)) {
+        return app_result;
+    }
+    
+    tinfo_t ptr_type;
+    ptr_type.create_ptr(struct_type);
+    
+    // Step 3: Apply the struct pointer type to the variable
+    z3::TypeApplicator applicator(config_.type_application_config);
+    
+    // Create an InferredType for the struct pointer
+    z3::InferredType inferred_ptr = z3::InferredType::make_ptr(
+        z3::InferredType::make_struct(struct_tid)
+    );
+    
+    qstring reason;
+    bool applied = applicator.apply_variable(
+        cfunc, var_idx, inferred_ptr, z3::TypeConfidence::High, &reason);
+    
+    if (applied) {
+        z3::TypeApplicationResult::AppliedType at;
+        at.var_idx = var_idx;
+        at.inferred = inferred_ptr;
+        at.applied = ptr_type;
+        at.confidence = z3::TypeConfidence::High;
+        
+        lvars_t* lvars = cfunc->get_lvars();
+        if (lvars && var_idx >= 0 && static_cast<size_t>(var_idx) < lvars->size()) {
+            at.var_name = (*lvars)[var_idx].name;
+        }
+        
+        app_result.applied.push_back(std::move(at));
+        app_result.applied_count++;
+        
+        detail::synth_log("[Structor] Applied struct type to variable %d\n", var_idx);
+    } else {
+        z3::TypeApplicationResult::FailedType ft;
+        ft.var_idx = var_idx;
+        ft.inferred = inferred_ptr;
+        ft.reason = reason;
+        app_result.failed.push_back(std::move(ft));
+        app_result.failed_count++;
+        
+        detail::synth_log("[Structor] Failed to apply type: %s\n", reason.c_str());
+    }
+    
+    // Step 4: Apply any additional inferred types if we have type inference results
+    if (config_.apply_inferred_types && last_type_inference_.has_value()) {
+        z3::TypeApplicationResult infer_app = z3::apply_inferred_types(
+            cfunc, *last_type_inference_, config_.type_application_config);
+        
+        // Merge results (skip the variable we just typed)
+        for (auto& at : infer_app.applied) {
+            if (at.var_idx != var_idx) {
+                app_result.applied.push_back(std::move(at));
+                app_result.applied_count++;
+            }
+        }
+        for (auto& ft : infer_app.failed) {
+            if (ft.var_idx != var_idx) {
+                app_result.failed.push_back(std::move(ft));
+                app_result.failed_count++;
+            }
+        }
+        for (auto& st : infer_app.skipped) {
+            if (st.var_idx != var_idx) {
+                app_result.skipped.push_back(std::move(st));
+                app_result.skipped_count++;
+            }
+        }
+    }
+    
+    // Step 5: Propagate types if configured
+    if (config_.type_application_config.propagate_types && applied) {
+        TypePropagator propagator;
+        PropagationResult prop = propagator.propagate(
+            cfunc->entry_ea, var_idx, ptr_type, PropagationDirection::Both);
+        
+        app_result.propagation = prop;
+        app_result.propagated_count = prop.success_count;
+        
+        if (prop.success_count > 0) {
+            detail::synth_log("[Structor] Propagated type to %d locations\n", 
+                             prop.success_count);
+        }
+    }
+    
+    // Step 6: Refresh decompiler
+    applicator.refresh_decompiler(cfunc);
+    
+    return app_result;
 }
 
 } // namespace structor

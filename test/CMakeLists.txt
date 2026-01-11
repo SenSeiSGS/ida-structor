@@ -96,6 +96,32 @@ add_test(NAME z3_synthesis_integration COMMAND test_z3_synthesis_integration)
 add_z3_test(test_e2e_synthesis test_e2e_synthesis.cpp)
 add_test(NAME e2e_synthesis COMMAND test_e2e_synthesis)
 
+# Type Lattice Tests (needs type_lattice.cpp implementation)
+add_executable(test_type_lattice
+    test_type_lattice.cpp
+    ${CMAKE_SOURCE_DIR}/src/z3/type_lattice.cpp
+    ${CMAKE_SOURCE_DIR}/src/z3/context.cpp
+    ${CMAKE_SOURCE_DIR}/src/z3/type_encoding.cpp
+)
+target_include_directories(test_type_lattice PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/test
+)
+target_compile_definitions(test_type_lattice PRIVATE STRUCTOR_TESTING)
+if(Z3_CUSTOM)
+    target_link_libraries(test_type_lattice PRIVATE z3_custom)
+elseif(Z3_USE_SYSTEM)
+    target_link_libraries(test_type_lattice PRIVATE z3::libz3)
+else()
+    target_include_directories(test_type_lattice PRIVATE
+        ${z3_SOURCE_DIR}/src/api
+        ${z3_SOURCE_DIR}/src/api/c++
+        ${z3_BINARY_DIR}/src/api
+    )
+    target_link_libraries(test_type_lattice PRIVATE libz3)
+endif()
+add_test(NAME type_lattice COMMAND test_type_lattice)
+
 # Add combined test target
 add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
@@ -107,12 +133,13 @@ add_custom_target(check
             test_z3_cross_function
             test_z3_synthesis_integration
             test_e2e_synthesis
+            test_type_lattice
 )
 
 # Add z3-only test target for quick Z3 testing
-# Run tests matching z3_ or e2e_ pattern
+# Run tests matching z3_ or e2e_ or type_ pattern
 add_custom_target(check_z3
-    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -R "^z3_|^e2e_"
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -R "^z3_|^e2e_|^type_"
     DEPENDS test_z3_context
             test_z3_type_encoding
             test_z3_array_detection
@@ -120,5 +147,6 @@ add_custom_target(check_z3
             test_z3_cross_function
             test_z3_synthesis_integration
             test_e2e_synthesis
+            test_type_lattice
     VERBATIM
 )

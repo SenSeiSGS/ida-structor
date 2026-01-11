@@ -60,6 +60,10 @@ public:
 
     qstring& append(char c) { data_ += c; return *this; }
     qstring& append(const char* s) { if (s) data_ += s; return *this; }
+    
+    qstring& operator+=(char c) { data_ += c; return *this; }
+    qstring& operator+=(const char* s) { if (s) data_ += s; return *this; }
+    qstring& operator+=(const qstring& other) { data_ += other.data_; return *this; }
 
     void sprnt(const char* fmt, ...) {
         char buf[4096];
@@ -121,10 +125,15 @@ enum type_flags : std::uint32_t {
     BTF_UINT64  = 0x100,
     BTF_FLOAT   = 0x200,
     BTF_DOUBLE  = 0x400,
+    BTF_BOOL    = 0x800,
     BT_INT8     = BTF_INT8,
     BTMT_CHAR   = 0x1000,
     BTMT_USIGNED = 0x2000,
 };
+
+// Forward declarations
+struct func_type_data_t;
+struct array_type_data_t;
 
 class tinfo_t {
 public:
@@ -143,23 +152,31 @@ public:
         array_count_ = count;
         pointed_type_ = std::make_shared<tinfo_t>(elem);
     }
-    bool create_func(const struct func_type_data_t& ftd) { is_func_ = true; return true; }
+    bool create_func(const struct func_type_data_t& ftd);
 
     bool is_ptr() const { return is_ptr_; }
     bool is_funcptr() const { return is_ptr_ && is_func_; }
     bool is_floating() const { return type_flags_ & (BTF_FLOAT | BTF_DOUBLE); }
     bool is_struct() const { return is_struct_; }
     bool is_array() const { return is_array_; }
+    bool is_func() const { return is_func_; }
+    bool is_void() const { return type_flags_ == BTF_VOID; }
+    bool is_union() const { return is_union_; }
+    bool is_signed() const { 
+        return (type_flags_ & (BTF_INT8 | BTF_INT16 | BTF_INT32 | BTF_INT64)) != 0;
+    }
 
     size_t get_size() const {
         if (is_ptr_) return 8;  // Assume 64-bit
         if (is_array_) return array_count_ * (pointed_type_ ? pointed_type_->get_size() : 1);
-        if (type_flags_ & (BTF_INT8 | BTF_UINT8)) return 1;
+        if (type_flags_ & (BTF_INT8 | BTF_UINT8 | BTF_BOOL)) return 1;
         if (type_flags_ & (BTF_INT16 | BTF_UINT16)) return 2;
         if (type_flags_ & (BTF_INT32 | BTF_UINT32 | BTF_FLOAT)) return 4;
         if (type_flags_ & (BTF_INT64 | BTF_UINT64 | BTF_DOUBLE)) return 8;
         return BADSIZE;
     }
+
+    tid_t get_tid() const { return struct_tid_; }
 
     bool get_pointed_object(tinfo_t* out) const {
         if (!is_ptr_ || !pointed_type_) return false;
@@ -172,7 +189,10 @@ public:
         return *pointed_type_;
     }
 
-    bool get_type_by_tid(tid_t tid) { return tid != BADADDR; }
+    bool get_func_details(func_type_data_t* ftd) const;
+    bool get_array_details(array_type_data_t* atd) const;
+
+    bool get_type_by_tid(tid_t tid) { struct_tid_ = tid; return tid != BADADDR; }
     bool get_named_type(void*, const char* name) { return name != nullptr; }
 
     void print(qstring* out) const {
@@ -192,9 +212,11 @@ private:
     bool is_func_ = false;
     bool is_struct_ = false;
     bool is_array_ = false;
+    bool is_union_ = false;
     size_t array_count_ = 0;
     std::shared_ptr<tinfo_t> pointed_type_;
     size_t pointed_size_ = 0;
+    tid_t struct_tid_ = BADADDR;
 };
 
 // ============================================================================
@@ -213,6 +235,32 @@ struct func_type_data_t : public qvector<funcarg_t> {
     void set_cc(int calling_conv) { cc = calling_conv; }
     int get_cc() const { return cc; }
 };
+
+struct array_type_data_t {
+    tinfo_t elem_type;
+    size_t nelems = 0;
+};
+
+// Inline implementations that depend on func_type_data_t
+inline bool tinfo_t::create_func(const func_type_data_t& ftd) { 
+    is_func_ = true; 
+    return true; 
+}
+
+inline bool tinfo_t::get_func_details(func_type_data_t* ftd) const {
+    if (!is_func_ || !ftd) return false;
+    // Return empty function details for mock
+    return true;
+}
+
+inline bool tinfo_t::get_array_details(array_type_data_t* atd) const {
+    if (!is_array_ || !atd) return false;
+    if (pointed_type_) {
+        atd->elem_type = *pointed_type_;
+    }
+    atd->nelems = array_count_;
+    return true;
+}
 
 // ============================================================================
 // Hex-Rays Mock Types
