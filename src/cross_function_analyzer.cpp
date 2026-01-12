@@ -448,6 +448,99 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::t
 }
 
 // ============================================================================
+// Return Flow Helpers
+// ============================================================================
+
+struct ReturnSource {
+    int   var_idx = -1;
+    sval_t delta = 0;
+};
+
+static void add_return_source(qvector<ReturnSource>& sources, int var_idx, sval_t delta) {
+    for (const auto& src : sources) {
+        if (src.var_idx == var_idx && src.delta == delta) {
+            return;
+        }
+    }
+    ReturnSource src;
+    src.var_idx = var_idx;
+    src.delta = delta;
+    sources.push_back(src);
+}
+
+class ReturnSourceFinder : public ctree_visitor_t {
+public:
+    ReturnSourceFinder() : ctree_visitor_t(CV_FAST) {}
+
+    int idaapi visit_insn(cinsn_t* insn) override {
+        if (!insn || insn->op != cit_return) return 0;
+        if (!insn->creturn) return 0;
+        cexpr_t* expr = &insn->creturn->expr;
+        if (!expr || expr->op == cot_empty) return 0;
+
+        auto info = utils::extract_ptr_arith(expr);
+        if (!info.valid || info.var_idx < 0) return 0;
+
+        add_return_source(sources_, info.var_idx, info.offset);
+        return 0;
+    }
+
+    [[nodiscard]] const qvector<ReturnSource>& sources() const noexcept { return sources_; }
+
+private:
+    qvector<ReturnSource> sources_;
+};
+
+class ReturnAssignmentFinder : public ctree_visitor_t {
+public:
+    explicit ReturnAssignmentFinder(qvector<std::pair<ea_t, int>>& results)
+        : ctree_visitor_t(CV_FAST)
+        , results_(results) {}
+
+    int idaapi visit_expr(cexpr_t* e) override {
+        if (!e || e->op != cot_asg) return 0;
+
+        cexpr_t* lhs = e->x;
+        cexpr_t* rhs = e->y;
+        while (rhs && rhs->op == cot_cast) {
+            rhs = rhs->x;
+        }
+
+        if (!rhs || rhs->op != cot_call || !rhs->x) return 0;
+        if (rhs->x->op != cot_obj) return 0;
+
+        cexpr_t* base = find_base_var(lhs);
+        if (!base || base->op != cot_var) return 0;
+
+        results_.push_back({rhs->x->obj_ea, base->v.idx});
+        return 0;
+    }
+
+private:
+    static cexpr_t* find_base_var(cexpr_t* expr) {
+        while (expr) {
+            if (expr->op == cot_var) return expr;
+            if (expr->op == cot_cast || expr->op == cot_ref) {
+                expr = expr->x;
+            } else if (expr->op == cot_add || expr->op == cot_sub) {
+                cexpr_t* left = find_base_var(expr->x);
+                if (left) return left;
+                expr = expr->y;
+            } else if (expr->op == cot_memref || expr->op == cot_memptr) {
+                expr = expr->x;
+            } else if (expr->op == cot_idx) {
+                expr = expr->x;
+            } else {
+                break;
+            }
+        }
+        return nullptr;
+    }
+
+    qvector<std::pair<ea_t, int>>& results_;
+};
+
+// ============================================================================
 // CrossFunctionAnalyzer Implementation
 // ============================================================================
 
@@ -567,6 +660,41 @@ void CrossFunctionAnalyzer::trace_forward(
         // Recurse
         trace_forward(callee_ea, param_idx, cumulative_delta, current_depth + 1, synth_opts);
     }
+
+    // Follow return assignments for this variable
+    auto return_assignments = find_return_assignments(cfunc);
+    for (const auto& [callee_ea, caller_var_idx] : return_assignments) {
+        if (caller_var_idx != var_idx) continue;
+        if (callee_ea == BADADDR) continue;
+
+        cfuncptr_t callee_cfunc = get_cfunc(callee_ea);
+        if (!callee_cfunc) continue;
+
+        auto return_sources = find_return_sources(callee_cfunc);
+        for (const auto& [return_var_idx, return_delta] : return_sources) {
+            FunctionVariable fv(callee_ea, return_var_idx, 0);
+            if (visited_.count(fv)) continue;
+
+            sval_t cumulative_delta = current_delta - return_delta;
+            add_variable(callee_ea, return_var_idx, cumulative_delta);
+
+            PointerFlowEdge edge;
+            edge.caller_ea = func_ea;
+            edge.callee_ea = callee_ea;
+            edge.caller_var_idx = var_idx;
+            edge.callee_param_idx = -1;  // return value
+            edge.delta = return_delta;
+            edge.is_direct_call = true;
+            add_flow_edge(edge);
+
+            AccessPattern pattern = collect_pattern(callee_ea, return_var_idx, synth_opts);
+            if (!pattern.accesses.empty()) {
+                collected_patterns_.push_back(std::move(pattern));
+            }
+
+            trace_forward(callee_ea, return_var_idx, cumulative_delta, current_depth + 1, synth_opts);
+        }
+    }
 }
 
 void CrossFunctionAnalyzer::trace_backward(
@@ -590,7 +718,47 @@ void CrossFunctionAnalyzer::trace_backward(
 
     lvar_t& var = lvars[var_idx];
 
-    // Only trace back if this is an argument
+    // Return-flow: connect callee return values to caller-assigned variables
+    auto return_sources = find_return_sources(cfunc);
+    for (const auto& [return_var_idx, return_delta] : return_sources) {
+        if (return_var_idx != var_idx) continue;
+
+        if (return_delta != 0) {
+            FunctionVariable current_fv(func_ea, var_idx, 0);
+            if (deltas_.count(current_fv)) {
+                deltas_[current_fv] -= return_delta;
+            }
+        }
+
+        auto callers = find_callers_with_return(func_ea);
+        for (const auto& [caller_ea, caller_var_idx] : callers) {
+            FunctionVariable fv(caller_ea, caller_var_idx, 0);
+            if (visited_.count(fv)) continue;
+
+            add_variable(caller_ea, caller_var_idx, 0);
+
+            PointerFlowEdge edge;
+            edge.caller_ea = caller_ea;
+            edge.callee_ea = func_ea;
+            edge.caller_var_idx = caller_var_idx;
+            edge.callee_param_idx = -1;  // return value
+            edge.delta = return_delta;
+            edge.is_direct_call = true;
+            add_flow_edge(edge);
+
+            AccessPattern pattern = collect_pattern(caller_ea, caller_var_idx, synth_opts);
+            if (!pattern.accesses.empty()) {
+                collected_patterns_.push_back(std::move(pattern));
+            }
+
+            trace_backward(caller_ea, caller_var_idx, 0, current_depth + 1, synth_opts);
+            if (config_.follow_forward) {
+                trace_forward(caller_ea, caller_var_idx, 0, current_depth + 1, synth_opts);
+            }
+        }
+    }
+
+    // Only trace back through parameters if this is an argument
     if (!var.is_arg_var()) return;
 
     // Find which parameter index this corresponds to
@@ -703,6 +871,49 @@ qvector<std::tuple<ea_t, int, sval_t>> CrossFunctionAnalyzer::find_callers_with_
 {
     CallerFinder finder(func_ea, param_idx);
     return finder.find_callers();
+}
+
+qvector<std::pair<int, sval_t>> CrossFunctionAnalyzer::find_return_sources(cfunc_t* cfunc) {
+    qvector<std::pair<int, sval_t>> result;
+    if (!cfunc) return result;
+
+    ReturnSourceFinder finder;
+    finder.apply_to(&cfunc->body, nullptr);
+
+    for (const auto& src : finder.sources()) {
+        result.push_back({src.var_idx, src.delta});
+    }
+
+    return result;
+}
+
+qvector<std::pair<ea_t, int>> CrossFunctionAnalyzer::find_return_assignments(cfunc_t* cfunc) {
+    qvector<std::pair<ea_t, int>> result;
+    if (!cfunc) return result;
+
+    ReturnAssignmentFinder finder(result);
+    finder.apply_to(&cfunc->body, nullptr);
+
+    return result;
+}
+
+qvector<std::pair<ea_t, int>> CrossFunctionAnalyzer::find_callers_with_return(ea_t func_ea) {
+    qvector<std::pair<ea_t, int>> result;
+
+    qvector<ea_t> caller_funcs = utils::get_callers(func_ea);
+    for (ea_t caller_ea : caller_funcs) {
+        cfuncptr_t caller_cfunc = get_cfunc(caller_ea);
+        if (!caller_cfunc) continue;
+
+        auto assignments = find_return_assignments(caller_cfunc);
+        for (const auto& [callee_ea, caller_var_idx] : assignments) {
+            if (callee_ea == func_ea) {
+                result.push_back({caller_ea, caller_var_idx});
+            }
+        }
+    }
+
+    return result;
 }
 
 AccessPattern CrossFunctionAnalyzer::collect_pattern(

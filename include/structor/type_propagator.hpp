@@ -71,6 +71,14 @@ private:
         int var_idx,
         qvector<std::pair<ea_t, int>>& sources);
 
+    void find_return_sources(
+        cfunc_t* cfunc,
+        qvector<std::pair<int, sval_t>>& sources);
+
+    void find_callers_with_return(
+        ea_t func_ea,
+        qvector<std::pair<ea_t, int>>& callers);
+
     [[nodiscard]] bool is_parameter(cfunc_t* cfunc, int var_idx);
     [[nodiscard]] int get_param_index(cfunc_t* cfunc, int var_idx);
 
@@ -249,6 +257,45 @@ inline void TypePropagator::propagate_forward(
             result.add_failure(std::move(site));
         }
     }
+
+    // Propagate through return-value assignments: var = callee()
+    qvector<std::pair<ea_t, int>> return_sources;
+    find_assigned_from(cfunc, var_idx, return_sources);
+    for (const auto& [callee_ea, ret_marker] : return_sources) {
+        (void)ret_marker;
+        cfuncptr_t callee_cfunc = utils::get_cfunc(callee_ea);
+        if (!callee_cfunc) continue;
+
+        qvector<std::pair<int, sval_t>> return_vars;
+        find_return_sources(callee_cfunc, return_vars);
+
+        for (const auto& [return_var_idx, return_delta] : return_vars) {
+            (void)return_delta;
+            auto key = make_visit_key(callee_ea, return_var_idx);
+            if (visited_.count(key)) continue;
+            visited_.insert(key);
+
+            PropagationSite site;
+            site.func_ea = callee_ea;
+            site.var_idx = return_var_idx;
+            site.new_type = type;
+            site.direction = PropagationDirection::Forward;
+
+            lvars_t& callee_lvars = *callee_cfunc->get_lvars();
+            if (return_var_idx >= 0 && static_cast<size_t>(return_var_idx) < callee_lvars.size()) {
+                site.var_name = callee_lvars[return_var_idx].name;
+                site.old_type = callee_lvars[return_var_idx].type();
+            }
+
+            if (apply_type(callee_cfunc, return_var_idx, type)) {
+                result.add_success(std::move(site));
+                propagate_forward(callee_ea, return_var_idx, type, depth + 1, result);
+            } else {
+                site.failure_reason = "Failed to apply type";
+                result.add_failure(std::move(site));
+            }
+        }
+    }
 }
 
 inline void TypePropagator::propagate_backward(
@@ -262,6 +309,51 @@ inline void TypePropagator::propagate_backward(
 
     cfuncptr_t cfunc = utils::get_cfunc(func_ea);
     if (!cfunc) return;
+
+    // Propagate through return-value assignments: caller_var = func()
+    qvector<std::pair<int, sval_t>> return_vars;
+    find_return_sources(cfunc, return_vars);
+    for (const auto& [return_var_idx, return_delta] : return_vars) {
+        if (return_var_idx != var_idx) continue;
+        (void)return_delta;
+
+        qvector<std::pair<ea_t, int>> callers;
+        find_callers_with_return(func_ea, callers);
+
+        for (const auto& [caller_ea, caller_var_idx] : callers) {
+            auto key = make_visit_key(caller_ea, caller_var_idx);
+            if (visited_.count(key)) continue;
+            visited_.insert(key);
+
+            cfuncptr_t caller_cfunc = utils::get_cfunc(caller_ea);
+            if (!caller_cfunc) continue;
+
+            PropagationSite site;
+            site.func_ea = caller_ea;
+            site.var_idx = caller_var_idx;
+            site.new_type = type;
+            site.direction = PropagationDirection::Backward;
+
+            lvars_t& caller_lvars = *caller_cfunc->get_lvars();
+            if (caller_var_idx >= 0 && static_cast<size_t>(caller_var_idx) < caller_lvars.size()) {
+                site.var_name = caller_lvars[caller_var_idx].name;
+                site.old_type = caller_lvars[caller_var_idx].type();
+            }
+
+            if (apply_type(caller_cfunc, caller_var_idx, type)) {
+                result.add_success(std::move(site));
+
+                // Continue backward propagation
+                propagate_backward(caller_ea, caller_var_idx, type, depth + 1, result);
+
+                // Also propagate forward to reach siblings
+                propagate_forward(caller_ea, caller_var_idx, type, depth + 1, result);
+            } else {
+                site.failure_reason = "Failed to apply type";
+                result.add_failure(std::move(site));
+            }
+        }
+    }
 
     // Check if this is a parameter
     if (!is_parameter(cfunc, var_idx)) return;
@@ -540,6 +632,110 @@ inline void TypePropagator::find_assigned_from(
 
     SourceVisitor visitor(var_idx, sources);
     visitor.apply_to(&cfunc->body, nullptr);
+}
+
+inline void TypePropagator::find_return_sources(
+    cfunc_t* cfunc,
+    qvector<std::pair<int, sval_t>>& sources)
+{
+    if (!cfunc) return;
+
+    struct ReturnVisitor : public ctree_visitor_t {
+        qvector<std::pair<int, sval_t>>& sources;
+
+        ReturnVisitor(qvector<std::pair<int, sval_t>>& s)
+            : ctree_visitor_t(CV_FAST)
+            , sources(s) {}
+
+        int idaapi visit_insn(cinsn_t* insn) override {
+            if (!insn || insn->op != cit_return) return 0;
+            if (!insn->creturn) return 0;
+
+            cexpr_t* expr = &insn->creturn->expr;
+            if (!expr || expr->op == cot_empty) return 0;
+
+            auto info = utils::extract_ptr_arith(expr);
+            if (!info.valid || info.var_idx < 0) return 0;
+
+            for (const auto& entry : sources) {
+                if (entry.first == info.var_idx && entry.second == info.offset) {
+                    return 0;
+                }
+            }
+
+            sources.push_back({info.var_idx, info.offset});
+            return 0;
+        }
+    };
+
+    ReturnVisitor visitor(sources);
+    visitor.apply_to(&cfunc->body, nullptr);
+}
+
+inline void TypePropagator::find_callers_with_return(
+    ea_t func_ea,
+    qvector<std::pair<ea_t, int>>& callers)
+{
+    qvector<ea_t> caller_funcs = utils::get_callers(func_ea);
+
+    for (ea_t caller_ea : caller_funcs) {
+        cfuncptr_t caller_cfunc = utils::get_cfunc(caller_ea);
+        if (!caller_cfunc) continue;
+
+        struct ReturnCallerFinder : public ctree_visitor_t {
+            ea_t target_func;
+            ea_t caller_ea;
+            qvector<std::pair<ea_t, int>>& results;
+
+            ReturnCallerFinder(ea_t func, ea_t caller, qvector<std::pair<ea_t, int>>& r)
+                : ctree_visitor_t(CV_FAST)
+                , target_func(func)
+                , caller_ea(caller)
+                , results(r) {}
+
+            static cexpr_t* find_base_var(cexpr_t* expr) {
+                while (expr) {
+                    if (expr->op == cot_var) return expr;
+                    if (expr->op == cot_cast || expr->op == cot_ref) {
+                        expr = expr->x;
+                    } else if (expr->op == cot_add || expr->op == cot_sub) {
+                        cexpr_t* left = find_base_var(expr->x);
+                        if (left) return left;
+                        expr = expr->y;
+                    } else if (expr->op == cot_memref || expr->op == cot_memptr) {
+                        expr = expr->x;
+                    } else if (expr->op == cot_idx) {
+                        expr = expr->x;
+                    } else {
+                        break;
+                    }
+                }
+                return nullptr;
+            }
+
+            int idaapi visit_expr(cexpr_t* expr) override {
+                if (!expr || expr->op != cot_asg) return 0;
+
+                cexpr_t* lhs = expr->x;
+                cexpr_t* rhs = expr->y;
+                while (rhs && rhs->op == cot_cast) {
+                    rhs = rhs->x;
+                }
+
+                if (!rhs || rhs->op != cot_call || !rhs->x) return 0;
+                if (rhs->x->op != cot_obj || rhs->x->obj_ea != target_func) return 0;
+
+                cexpr_t* base = find_base_var(lhs);
+                if (!base || base->op != cot_var) return 0;
+
+                results.push_back({caller_ea, base->v.idx});
+                return 0;
+            }
+        };
+
+        ReturnCallerFinder finder(func_ea, caller_ea, callers);
+        finder.apply_to(&caller_cfunc->body, nullptr);
+    }
 }
 
 inline bool TypePropagator::is_parameter(cfunc_t* cfunc, int var_idx) {

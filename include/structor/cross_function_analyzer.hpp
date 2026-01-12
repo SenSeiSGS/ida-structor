@@ -287,6 +287,15 @@ private:
     /// Get or decompile a function (with caching)
     [[nodiscard]] cfuncptr_t get_cfunc(ea_t func_ea);
 
+    /// Collect return sources as (var_idx, delta) pairs
+    [[nodiscard]] qvector<std::pair<int, sval_t>> find_return_sources(cfunc_t* cfunc);
+
+    /// Find assignments of call return values in the current function
+    [[nodiscard]] qvector<std::pair<ea_t, int>> find_return_assignments(cfunc_t* cfunc);
+
+    /// Find callers that assign this function's return to a variable
+    [[nodiscard]] qvector<std::pair<ea_t, int>> find_callers_with_return(ea_t func_ea);
+
     /// Internal function cache to avoid redundant decompilation
     std::unordered_map<ea_t, cfuncptr_t> cfunc_cache_;
 };
