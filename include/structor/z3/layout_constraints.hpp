@@ -209,7 +209,8 @@ private:
 /// Create a SynthField from a FieldCandidate and model
 [[nodiscard]] SynthField field_from_candidate(
     const FieldCandidate& candidate,
-    TypeEncoder& type_encoder
+    TypeEncoder& type_encoder,
+    const qvector<FieldAccess>* access_list = nullptr
 );
 
 /// Check if two candidates are compatible for the same union

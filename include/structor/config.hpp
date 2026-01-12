@@ -137,6 +137,7 @@ struct SynthOptions {
     int             max_propagation_depth;  // Maximum propagation depth
     bool            propagate_to_callers;   // Backward propagation
     bool            propagate_to_callees;   // Forward propagation
+    bool            emit_substructs;        // Emit nested sub-struct fields when detected
     bool            debug_mode;         // Enable debug logging (adopted from Suture)
     AccessPredicate access_filter;      // Filter predicate for accesses (adopted from Suture)
 
@@ -157,6 +158,7 @@ struct SynthOptions {
         , max_propagation_depth(3)
         , propagate_to_callers(true)
         , propagate_to_callees(true)
+        , emit_substructs(true)
         , debug_mode(false)
         , access_filter(predicates::accept_all)
         , z3() {}
@@ -309,6 +311,8 @@ inline bool Config::load() {
             options_.propagate_to_callers = parse_bool(value);
         } else if (key == "propagate_to_callees") {
             options_.propagate_to_callees = parse_bool(value);
+        } else if (key == "emit_substructs") {
+            options_.emit_substructs = parse_bool(value);
         } else if (key == "debug_mode") {
             options_.debug_mode = parse_bool(value);
         }
@@ -378,6 +382,7 @@ inline bool Config::save() {
     file << "min_accesses=" << options_.min_accesses << "\n";
     file << "alignment=" << options_.alignment << "\n";
     file << "vtable_detection=" << (options_.vtable_detection ? "true" : "false") << "\n";
+    file << "emit_substructs=" << (options_.emit_substructs ? "true" : "false") << "\n";
     file << "\n";
 
     file << "[Propagation]\n";

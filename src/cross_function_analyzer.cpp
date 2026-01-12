@@ -5,7 +5,219 @@
 #include <algorithm>
 #include <queue>
 
+#ifndef STRUCTOR_TESTING
+#include <nalt.hpp>
+#include <funcs.hpp>
+#endif
+
 namespace structor {
+
+namespace {
+    tinfo_t build_funcptr_type_from_call(const cexpr_t* call_expr) {
+        tinfo_t result;
+        if (!call_expr || call_expr->op != cot_call) {
+            return result;
+        }
+
+        func_type_data_t ftd;
+        if (!call_expr->type.empty()) {
+            ftd.rettype = call_expr->type;
+        } else {
+            ftd.rettype.create_simple_type(BTF_VOID);
+        }
+        ftd.set_cc(CM_CC_UNKNOWN);
+
+        if (call_expr->a) {
+            for (const auto& arg : *call_expr->a) {
+                tinfo_t arg_type = arg.type;
+                if (arg_type.empty()) {
+                    tinfo_t void_type;
+                    void_type.create_simple_type(BTF_VOID);
+                    arg_type.create_ptr(void_type);
+                }
+                funcarg_t farg;
+                farg.type = arg_type;
+                ftd.push_back(farg);
+            }
+        }
+
+        tinfo_t func_type;
+        if (func_type.create_func(ftd)) {
+            result.create_ptr(func_type);
+        }
+
+        return result;
+    }
+
+    tinfo_t get_call_funcptr_type(const cexpr_t* call_expr) {
+        tinfo_t result;
+        if (!call_expr) {
+            return result;
+        }
+
+        if (call_expr->x && !call_expr->x->type.empty()) {
+            tinfo_t callee_type = call_expr->x->type;
+            if (callee_type.is_funcptr()) {
+                return callee_type;
+            }
+            if (callee_type.is_ptr()) {
+                tinfo_t pointed = callee_type.get_pointed_object();
+                if (!pointed.empty() && pointed.is_func()) {
+                    return callee_type;
+                }
+            }
+            if (callee_type.is_func()) {
+                tinfo_t ptr_type;
+                ptr_type.create_ptr(callee_type);
+                return ptr_type;
+            }
+        }
+
+        return build_funcptr_type_from_call(call_expr);
+    }
+
+    bool extract_func_type(const tinfo_t& type, tinfo_t& out) {
+        if (type.empty()) {
+            return false;
+        }
+
+        if (type.is_func()) {
+            out = type;
+            return true;
+        }
+
+        if (type.is_funcptr()) {
+            tinfo_t pointed = type.get_pointed_object();
+            if (!pointed.empty()) {
+                out = pointed;
+                return true;
+            }
+        }
+
+        if (type.is_ptr()) {
+            tinfo_t pointed = type.get_pointed_object();
+            if (!pointed.empty() && pointed.is_func()) {
+                out = pointed;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    qvector<ea_t> resolve_indirect_callees(const tinfo_t& funcptr_type, size_t max_results) {
+        qvector<ea_t> matches;
+
+#ifndef STRUCTOR_TESTING
+        if (funcptr_type.empty() || max_results == 0) {
+            return matches;
+        }
+
+        tinfo_t target_func;
+        if (!extract_func_type(funcptr_type, target_func)) {
+            return matches;
+        }
+
+        static std::unordered_map<std::string, qvector<ea_t>> cache;
+        std::string key = utils::type_to_string(funcptr_type).c_str();
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+
+        int target_nargs = target_func.get_nargs();
+        size_t func_qty = get_func_qty();
+
+        for (size_t i = 0; i < func_qty; ++i) {
+            func_t* fn = getn_func(i);
+            if (!fn) {
+                continue;
+            }
+
+            tinfo_t fn_type;
+            if (!get_tinfo(&fn_type, fn->start_ea)) {
+                continue;
+            }
+
+            tinfo_t fn_func;
+            if (!extract_func_type(fn_type, fn_func)) {
+                continue;
+            }
+
+            if (target_nargs >= 0) {
+                int fn_nargs = fn_func.get_nargs();
+                if (fn_nargs >= 0 && fn_nargs != target_nargs) {
+                    continue;
+                }
+            }
+
+            if (fn_func.compare_with(target_func, TCMP_IGNMODS | TCMP_CALL)) {
+                matches.push_back(fn->start_ea);
+                if (matches.size() >= max_results) {
+                    break;
+                }
+            }
+        }
+
+        cache[key] = matches;
+#else
+        (void)funcptr_type;
+        (void)max_results;
+#endif
+
+        return matches;
+    }
+
+    void recompute_pattern_bounds(AccessPattern& pattern) {
+        if (pattern.accesses.empty()) {
+            pattern.min_offset = 0;
+            pattern.max_offset = 0;
+            return;
+        }
+
+        pattern.sort_by_offset();
+        pattern.min_offset = pattern.accesses.front().offset;
+        pattern.max_offset = pattern.accesses.front().offset +
+                             static_cast<sval_t>(pattern.accesses.front().size);
+
+        for (const auto& access : pattern.accesses) {
+            pattern.min_offset = std::min(pattern.min_offset, access.offset);
+            pattern.max_offset = std::max(pattern.max_offset,
+                access.offset + static_cast<sval_t>(access.size));
+        }
+    }
+
+    void adjust_pattern_for_base_indirection(AccessPattern& pattern, std::uint8_t adjust) {
+        if (adjust == 0 || pattern.accesses.empty()) {
+            return;
+        }
+
+        qvector<FieldAccess> adjusted;
+        adjusted.reserve(pattern.accesses.size());
+
+        for (auto& access : pattern.accesses) {
+            if (!access.base_indirection.has_value()) {
+                adjusted.push_back(std::move(access));
+                continue;
+            }
+            if (*access.base_indirection < adjust) {
+                continue;
+            }
+
+            std::uint8_t new_depth = static_cast<std::uint8_t>(*access.base_indirection - adjust);
+            if (new_depth == 0) {
+                access.base_indirection.reset();
+            } else {
+                access.base_indirection = new_depth;
+            }
+
+            adjusted.push_back(std::move(access));
+        }
+
+        pattern.accesses = std::move(adjusted);
+        recompute_pattern_bounds(pattern);
+    }
+}
 
 // ============================================================================
 // UnifiedAccessPattern Implementation
@@ -112,8 +324,31 @@ UnifiedAccessPattern UnifiedAccessPattern::merge(
                     existing.is_vtable_access = true;
                     existing.vtable_slot = access.vtable_slot;
                 }
+                if (!access.bitfields.empty()) {
+                    for (const auto& bf : access.bitfields) {
+                        existing.add_bitfield(bf);
+                    }
+                }
+
+                if (access.array_stride_hint.has_value()) {
+                    if (!existing.array_stride_hint.has_value()) {
+                        existing.array_stride_hint = access.array_stride_hint;
+                    } else if (*existing.array_stride_hint != *access.array_stride_hint) {
+                        existing.array_stride_hint.reset();
+                    }
+                }
+
+                if (access.base_indirection.has_value()) {
+                    if (!existing.base_indirection.has_value()) {
+                        existing.base_indirection = access.base_indirection;
+                    } else if (*existing.base_indirection != *access.base_indirection) {
+                        existing.base_indirection.reset();
+                    }
+                }
+
                 found = true;
                 break;
+
             }
         }
         if (!found) {
@@ -188,7 +423,7 @@ int ArgDeltaExtractor::visit_expr(cexpr_t* e) {
     return 0;
 }
 
-bool ArgDeltaExtractor::is_target_var(cexpr_t* e) const noexcept {
+bool ArgDeltaExtractor::is_target_var(cexpr_t* e) noexcept {
     if (!e) return false;
 
     // Direct variable reference
@@ -196,9 +431,16 @@ bool ArgDeltaExtractor::is_target_var(cexpr_t* e) const noexcept {
         return true;
     }
 
-    // Through cast or address-of
-    if (e->op == cot_cast || e->op == cot_ref) {
+    if (e->op == cot_cast) {
         return is_target_var(e->x);
+    }
+
+    if (e->op == cot_ref) {
+        if (is_target_var(e->x)) {
+            by_ref_ = true;
+            return true;
+        }
+        return false;
     }
 
     return false;
@@ -241,6 +483,8 @@ void CallSiteFinder::process_call(cexpr_t* call_expr) {
             info.arg_idx = static_cast<int>(i);
             info.delta = extractor.delta().value_or(0);
             info.is_direct = is_direct_call(call_expr);
+            info.by_ref = extractor.by_ref();
+            info.funcptr_type = get_call_funcptr_type(call_expr);
 
             calls_.push_back(info);
         }
@@ -284,8 +528,8 @@ CallerFinder::CallerFinder(ea_t target_func, int param_idx)
     : target_func_(target_func)
     , param_idx_(param_idx) {}
 
-qvector<std::tuple<ea_t, int, sval_t>> CallerFinder::find_callers() {
-    qvector<std::tuple<ea_t, int, sval_t>> result;
+qvector<CallerCallInfo> CallerFinder::find_callers() {
+    qvector<CallerCallInfo> result;
 
     // Find all cross-references to this function
     xrefblk_t xref;
@@ -311,7 +555,7 @@ qvector<std::tuple<ea_t, int, sval_t>> CallerFinder::find_callers() {
     return result;
 }
 
-void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::tuple<ea_t, int, sval_t>>& result) {
+void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<CallerCallInfo>& result) {
     // Decompile the caller
     cfuncptr_t cfunc = utils::get_cfunc(caller_ea);
     if (!cfunc) return;
@@ -321,16 +565,35 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::t
         ea_t target_ea;
         ea_t callee_ea;
         int param_idx;
-        qvector<std::tuple<ea_t, int, sval_t>>* result;
+        qvector<CallerCallInfo>* result;
         cfunc_t* cfunc;
 
-        CallLocator(ea_t ea, ea_t callee, int idx, qvector<std::tuple<ea_t, int, sval_t>>* r, cfunc_t* cf)
+        CallLocator(ea_t ea, ea_t callee, int idx, qvector<CallerCallInfo>* r, cfunc_t* cf)
             : ctree_visitor_t(CV_FAST)
             , target_ea(ea)
             , callee_ea(callee)
             , param_idx(idx)
             , result(r)
             , cfunc(cf) {}
+
+        static bool contains_ref(const cexpr_t* expr) {
+            if (!expr) return false;
+            if (expr->op == cot_ref) return true;
+
+            switch (expr->op) {
+                case cot_cast:
+                case cot_ptr:
+                case cot_memref:
+                case cot_memptr:
+                case cot_idx:
+                    return contains_ref(expr->x);
+                case cot_add:
+                case cot_sub:
+                    return contains_ref(expr->x) || contains_ref(expr->y);
+                default:
+                    return false;
+            }
+        }
 
         int idaapi visit_expr(cexpr_t* e) override {
             if (!e || e->op != cot_call) return 0;
@@ -343,14 +606,24 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::t
                 // Found the call - extract the argument and delta
                 if (e->a && static_cast<size_t>(param_idx) < e->a->size()) {
                     carg_t& arg = (*e->a)[param_idx];
+                    const bool by_ref = contains_ref(&arg);
+                    auto push_info = [&](int var_idx, sval_t delta) {
+                        CallerCallInfo info;
+                        info.call_ea = target_ea;
+                        info.caller_ea = cfunc->entry_ea;
+                        info.var_idx = var_idx;
+                        info.delta = delta;
+                        info.by_ref = by_ref;
+                        result->push_back(std::move(info));
+                    };
 
                     // Check if argument is a simple variable reference (delta = 0)
                     if (arg.op == cot_var) {
-                        result->push_back({cfunc->entry_ea, arg.v.idx, 0});
+                        push_info(arg.v.idx, 0);
                     }
                     // Also handle casts (delta = 0)
                     else if (arg.op == cot_cast && arg.x && arg.x->op == cot_var) {
-                        result->push_back({cfunc->entry_ea, arg.x->v.idx, 0});
+                        push_info(arg.x->v.idx, 0);
                     }
                     // Handle ptr + delta (including casts like (char*)ptr + offset)
                     else if (arg.op == cot_add) {
@@ -385,7 +658,7 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::t
                         }
 
                         if (var_side) {
-                            result->push_back({cfunc->entry_ea, var_side->v.idx, delta});
+                            push_info(var_side->v.idx, delta);
                         }
                     }
                     // Handle ptr - delta (negative offset)
@@ -408,7 +681,7 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::t
                         var_side = find_var(arg.x);
                         if (var_side && arg.y && arg.y->op == cot_num) {
                             delta = -static_cast<sval_t>(arg.y->numval());
-                            result->push_back({cfunc->entry_ea, var_side->v.idx, delta});
+                            push_info(var_side->v.idx, delta);
                         }
                     }
                     // Handle &struct.field (cot_ref of member access)
@@ -419,7 +692,7 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<std::t
                         // Unwrap to find the base variable and accumulate field offsets
                         while (inner) {
                             if (inner->op == cot_var) {
-                                result->push_back({cfunc->entry_ea, inner->v.idx, field_offset});
+                                push_info(inner->v.idx, field_offset);
                                 break;
                             }
                             if (inner->op == cot_memref || inner->op == cot_memptr) {
@@ -551,6 +824,7 @@ void CrossFunctionAnalyzer::reset() {
     equiv_class_ = TypeEquivalenceClass();
     stats_ = CrossFunctionStats();
     visited_.clear();
+    base_indirection_adjusted_.clear();
     deltas_.clear();
     collected_patterns_.clear();
     cfunc_cache_.clear();
@@ -624,41 +898,61 @@ void CrossFunctionAnalyzer::trace_forward(
     // Find all call sites where this variable is passed as an argument
     auto callees = find_callees_with_arg(cfunc, var_idx);
 
-    for (const auto& [callee_ea, param_idx, arg_delta] : callees) {
-        if (callee_ea == BADADDR) continue;  // Skip indirect calls
+    for (const auto& call : callees) {
+        qvector<ea_t> targets;
+        if (call.callee_ea != BADADDR) {
+            targets.push_back(call.callee_ea);
+        } else if (config_.include_indirect_calls && !call.funcptr_type.empty()) {
+            size_t max_results = config_.max_functions > 0
+                ? static_cast<size_t>(config_.max_functions)
+                : static_cast<size_t>(32);
+            targets = resolve_indirect_callees(call.funcptr_type, max_results);
+        }
 
-        if (!config_.include_indirect_calls && callee_ea == BADADDR) {
+        if (targets.empty()) {
             continue;
         }
 
-        // Check if we've already visited this function/param
-        FunctionVariable fv(callee_ea, param_idx, 0);
-        if (visited_.count(fv)) continue;
+        for (ea_t callee_ea : targets) {
+            int param_idx = call.arg_idx;
+            sval_t arg_delta = call.delta;
 
-        // Calculate cumulative delta
-        sval_t cumulative_delta = current_delta + arg_delta;
+            // Check if we've already visited this function/param
+            FunctionVariable fv(callee_ea, param_idx, 0);
+            if (visited_.count(fv)) continue;
 
-        // Add to equivalence class
-        add_variable(callee_ea, param_idx, cumulative_delta);
+            // Calculate cumulative delta
+            sval_t cumulative_delta = current_delta + arg_delta;
 
-        // Record flow edge
-        PointerFlowEdge edge;
-        edge.caller_ea = func_ea;
-        edge.callee_ea = callee_ea;
-        edge.caller_var_idx = var_idx;
-        edge.callee_param_idx = param_idx;
-        edge.delta = arg_delta;
-        edge.is_direct_call = true;  // We only track direct calls for now
-        add_flow_edge(edge);
+            // Add to equivalence class
+            add_variable(callee_ea, param_idx, cumulative_delta);
 
-        // Collect pattern for this function
-        AccessPattern pattern = collect_pattern(callee_ea, param_idx, synth_opts);
-        if (!pattern.accesses.empty()) {
-            collected_patterns_.push_back(std::move(pattern));
+            // Record flow edge
+            PointerFlowEdge edge;
+            edge.caller_ea = func_ea;
+            edge.callee_ea = callee_ea;
+            edge.call_site = call.call_ea;
+            edge.caller_var_idx = var_idx;
+            edge.callee_param_idx = param_idx;
+            edge.delta = arg_delta;
+            edge.is_direct_call = call.is_direct;
+            add_flow_edge(edge);
+
+            // Collect pattern for this function
+            AccessPattern pattern = collect_pattern(callee_ea, param_idx, synth_opts);
+            if (call.by_ref) {
+                FunctionVariable adjusted_key(callee_ea, param_idx, 0);
+                if (base_indirection_adjusted_.insert(adjusted_key).second) {
+                    adjust_pattern_for_base_indirection(pattern, 1);
+                }
+            }
+            if (!pattern.accesses.empty()) {
+                collected_patterns_.push_back(std::move(pattern));
+            }
+
+            // Recurse
+            trace_forward(callee_ea, param_idx, cumulative_delta, current_depth + 1, synth_opts);
         }
-
-        // Recurse
-        trace_forward(callee_ea, param_idx, cumulative_delta, current_depth + 1, synth_opts);
     }
 
     // Follow return assignments for this variable
@@ -737,6 +1031,7 @@ void CrossFunctionAnalyzer::trace_backward(
 
             add_variable(caller_ea, caller_var_idx, 0);
 
+
             PointerFlowEdge edge;
             edge.caller_ea = caller_ea;
             edge.callee_ea = func_ea;
@@ -775,11 +1070,23 @@ void CrossFunctionAnalyzer::trace_backward(
     // Find callers that pass to this parameter (includes delta from call expression)
     auto callers = find_callers_with_param(func_ea, param_idx);
 
-    for (const auto& [caller_ea, caller_var_idx, arg_delta] : callers) {
-        if (caller_ea == BADADDR) continue;
+    for (const auto& call : callers) {
+        if (call.caller_ea == BADADDR) continue;
+
+        if (call.by_ref) {
+            FunctionVariable adjusted_key(func_ea, var_idx, 0);
+            if (base_indirection_adjusted_.insert(adjusted_key).second) {
+                for (auto& pattern : collected_patterns_) {
+                    if (pattern.func_ea == func_ea && pattern.var_idx == var_idx) {
+                        adjust_pattern_for_base_indirection(pattern, 1);
+                        break;
+                    }
+                }
+            }
+        }
 
         // Check if we've already visited
-        FunctionVariable fv(caller_ea, caller_var_idx, 0);
+        FunctionVariable fv(call.caller_ea, call.var_idx, 0);
         if (visited_.count(fv)) continue;
 
         // The arg_delta is extracted from the call expression.
@@ -798,49 +1105,49 @@ void CrossFunctionAnalyzer::trace_backward(
         // - process_node_d's delta should be 0
 
         // Update current function's delta if arg_delta is non-zero
-        if (arg_delta != 0) {
+        if (call.delta != 0) {
             FunctionVariable current_fv(func_ea, var_idx, 0);
             if (deltas_.count(current_fv)) {
-                deltas_[current_fv] += arg_delta;
+                deltas_[current_fv] += call.delta;
             }
         }
 
         // Caller gets delta = 0 (it has the original struct)
-        add_variable(caller_ea, caller_var_idx, 0);
+        add_variable(call.caller_ea, call.var_idx, 0);
 
         // Record flow edge (reversed direction)
         PointerFlowEdge edge;
-        edge.caller_ea = caller_ea;
+        edge.caller_ea = call.caller_ea;
         edge.callee_ea = func_ea;
-        edge.caller_var_idx = caller_var_idx;
+        edge.caller_var_idx = call.var_idx;
         edge.callee_param_idx = var_idx;
-        edge.delta = arg_delta;
+        edge.delta = call.delta;
         edge.is_direct_call = true;
         add_flow_edge(edge);
 
         // Collect pattern
-        AccessPattern pattern = collect_pattern(caller_ea, caller_var_idx, synth_opts);
+        AccessPattern pattern = collect_pattern(call.caller_ea, call.var_idx, synth_opts);
         if (!pattern.accesses.empty()) {
             collected_patterns_.push_back(std::move(pattern));
         }
 
         // Recurse backward with delta=0 (caller has original struct)
-        trace_backward(caller_ea, caller_var_idx, 0, current_depth + 1, synth_opts);
+        trace_backward(call.caller_ea, call.var_idx, 0, current_depth + 1, synth_opts);
 
         // IMPORTANT: Also trace forward from the caller to discover sibling callees.
         // This ensures that if main() calls both traverse_list() and sum_list()
         // with the same struct, we collect access patterns from all siblings.
         if (config_.follow_forward) {
-            trace_forward(caller_ea, caller_var_idx, 0, current_depth + 1, synth_opts);
+            trace_forward(call.caller_ea, call.var_idx, 0, current_depth + 1, synth_opts);
         }
     }
 }
 
-qvector<std::tuple<ea_t, int, sval_t>> CrossFunctionAnalyzer::find_callees_with_arg(
+qvector<CalleeCallInfo> CrossFunctionAnalyzer::find_callees_with_arg(
     cfunc_t* cfunc,
     int var_idx)
 {
-    qvector<std::tuple<ea_t, int, sval_t>> result;
+    qvector<CalleeCallInfo> result;
 
     if (!cfunc) return result;
 
@@ -849,7 +1156,15 @@ qvector<std::tuple<ea_t, int, sval_t>> CrossFunctionAnalyzer::find_callees_with_
 
     for (const auto& call : finder.calls()) {
         if (call.callee_ea != BADADDR || config_.include_indirect_calls) {
-            result.push_back({call.callee_ea, call.arg_idx, call.delta});
+            CalleeCallInfo info;
+            info.call_ea = call.call_ea;
+            info.callee_ea = call.callee_ea;
+            info.arg_idx = call.arg_idx;
+            info.delta = call.delta;
+            info.is_direct = call.is_direct;
+            info.by_ref = call.by_ref;
+            info.funcptr_type = call.funcptr_type;
+            result.push_back(std::move(info));
         }
     }
 
@@ -865,7 +1180,7 @@ std::optional<sval_t> CrossFunctionAnalyzer::extract_arg_delta(
     return extractor.delta();
 }
 
-qvector<std::tuple<ea_t, int, sval_t>> CrossFunctionAnalyzer::find_callers_with_param(
+qvector<CallerCallInfo> CrossFunctionAnalyzer::find_callers_with_param(
     ea_t func_ea,
     int param_idx)
 {

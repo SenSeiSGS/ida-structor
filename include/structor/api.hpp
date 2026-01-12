@@ -208,6 +208,7 @@ inline SynthResult StructorAPI::do_synthesis(ea_t func_ea, int var_idx, const Sy
     LayoutSynthesizer synthesizer(opts);
     SynthesisResult synth_result = synthesizer.synthesize(pattern);
     SynthStruct synth_struct = std::move(synth_result.structure);
+    qvector<SubStructInfo> sub_structs = std::move(synth_result.sub_structs);
 
     result.conflicts = synth_result.conflicts;
 
@@ -227,7 +228,9 @@ inline SynthResult StructorAPI::do_synthesis(ea_t func_ea, int var_idx, const Sy
 
     // Persist structure to IDB
     StructurePersistence persistence(opts);
-    tid_t struct_tid = persistence.create_struct(synth_struct);
+    tid_t struct_tid = sub_structs.empty()
+        ? persistence.create_struct(synth_struct)
+        : persistence.create_struct_with_substructs(synth_struct, sub_structs);
 
     if (struct_tid == BADADDR) {
         return SynthResult::make_error(SynthError::TypeCreationFailed,

@@ -47,6 +47,28 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
             continue;
         }
 
+        // Honor stride hints from index expressions when available
+        auto stride_hint = extract_stride_hint(group);
+        if (stride_hint.has_value()) {
+            auto hinted_result = find_progression_with_stride(offsets, group, *stride_hint);
+            if (hinted_result.has_value()) {
+                auto [base, stride] = *hinted_result;
+
+                // Verify type consistency if required
+                if (config_.require_consistent_types && !verify_type_consistency(group)) {
+                    continue;
+                }
+
+                uint32_t count = static_cast<uint32_t>((offsets.back() - base) / stride) + 1;
+                ArrayCandidate candidate = create_candidate(base, stride, count, group);
+
+                candidates.push_back(std::move(candidate));
+                stats_.arrays_found++;
+                stats_.elements_covered += static_cast<int>(offsets.size());
+                continue;
+            }
+        }
+
         // Try simple arithmetic progression detection first
         auto ap_result = find_arithmetic_progression(offsets);
 
@@ -140,6 +162,74 @@ ArrayConstraintBuilder::find_arithmetic_progression(const qvector<sval_t>& offse
     }
 
     return std::make_pair(base, stride);
+}
+
+std::optional<uint32_t> ArrayConstraintBuilder::extract_stride_hint(
+    const qvector<const FieldAccess*>& accesses) const
+{
+    std::optional<uint32_t> hint;
+
+    for (const auto* access : accesses) {
+        if (!access || !access->array_stride_hint.has_value()) {
+            continue;
+        }
+
+        uint32_t value = *access->array_stride_hint;
+        if (value == 0 || value > config_.max_stride) {
+            continue;
+        }
+
+        if (!hint.has_value()) {
+            hint = value;
+        } else if (*hint != value) {
+            return std::nullopt;
+        }
+    }
+
+    return hint;
+}
+
+std::optional<std::pair<sval_t, uint32_t>> ArrayConstraintBuilder::find_progression_with_stride(
+    const qvector<sval_t>& offsets,
+    const qvector<const FieldAccess*>& accesses,
+    uint32_t stride_hint) const
+{
+    if (stride_hint == 0 || stride_hint > config_.max_stride) {
+        return std::nullopt;
+    }
+    if (offsets.size() < 2) {
+        return std::nullopt;
+    }
+
+    uint32_t inner_offset = 0;
+    if (!check_struct_element_pattern(accesses, stride_hint, inner_offset)) {
+        sval_t base = offsets.front();
+        for (const auto& offset : offsets) {
+            if ((offset - base) % static_cast<sval_t>(stride_hint) != 0) {
+                return std::nullopt;
+            }
+        }
+        inner_offset = 0;
+    }
+
+    sval_t base = offsets.front() - static_cast<sval_t>(inner_offset);
+    for (const auto& offset : offsets) {
+        if ((offset - base) % static_cast<sval_t>(stride_hint) != 0) {
+            return std::nullopt;
+        }
+    }
+
+    size_t expected_count = static_cast<size_t>((offsets.back() - base) / stride_hint) + 1;
+    if (expected_count == 0 || expected_count > config_.max_elements) {
+        return std::nullopt;
+    }
+
+    double coverage_ratio = static_cast<double>(offsets.size()) / expected_count;
+    if (coverage_ratio < 1.0 / config_.max_gap_ratio) {
+        return std::nullopt;
+    }
+
+    return std::make_pair(base, stride_hint);
 }
 
 bool ArrayConstraintBuilder::verify_type_consistency(
@@ -306,6 +396,19 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
     }
     std::sort(offsets.begin(), offsets.end());
 
+    auto stride_hint = extract_stride_hint(accesses);
+    if (stride_hint.has_value()) {
+        auto hinted = find_progression_with_stride(offsets, accesses, *stride_hint);
+        if (hinted.has_value()) {
+            auto [base, stride] = *hinted;
+            uint32_t count = static_cast<uint32_t>((offsets.back() - base) / stride) + 1;
+            if (count >= static_cast<uint32_t>(config_.min_elements) &&
+                count <= config_.max_elements) {
+                return create_candidate(base, stride, count, accesses);
+            }
+        }
+    }
+
     // Calculate GCD stride
     uint32_t stride = calculate_gcd_stride(offsets);
     if (stride == 0 || stride > config_.max_stride) {
@@ -349,7 +452,7 @@ uint32_t ArrayConstraintBuilder::calculate_gcd_stride(const qvector<sval_t>& off
 bool ArrayConstraintBuilder::check_struct_element_pattern(
     const qvector<const FieldAccess*>& accesses,
     uint32_t stride,
-    uint32_t& inner_offset)
+    uint32_t& inner_offset) const
 {
     if (accesses.empty() || stride == 0) return false;
 

@@ -133,6 +133,17 @@ private:
     [[nodiscard]] std::optional<std::pair<sval_t, uint32_t>>  // (base, stride)
     find_arithmetic_progression(const qvector<sval_t>& offsets);
 
+    /// Extract a consistent stride hint from accesses
+    [[nodiscard]] std::optional<uint32_t>
+    extract_stride_hint(const qvector<const FieldAccess*>& accesses) const;
+
+    /// Use a stride hint to validate a progression
+    [[nodiscard]] std::optional<std::pair<sval_t, uint32_t>>  // (base, stride)
+    find_progression_with_stride(
+        const qvector<sval_t>& offsets,
+        const qvector<const FieldAccess*>& accesses,
+        uint32_t stride_hint) const;
+
     /// Verify type consistency for potential array elements
     [[nodiscard]] bool verify_type_consistency(
         const qvector<const FieldAccess*>& accesses
@@ -157,7 +168,7 @@ private:
         const qvector<const FieldAccess*>& accesses,
         uint32_t stride,
         uint32_t& inner_offset
-    );
+    ) const;
 };
 
 /// Quick check: can these offsets possibly form an array?

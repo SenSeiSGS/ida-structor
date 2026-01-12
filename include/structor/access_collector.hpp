@@ -6,6 +6,8 @@
 
 namespace structor {
 
+struct BitfieldInfo;
+
 /// Visitor that collects all access patterns for a specific variable
 class AccessPatternVisitor : public ctree_visitor_t {
 public:
@@ -29,6 +31,16 @@ private:
     void process_memptr_access(cexpr_t* expr);
     void process_call_through_ptr(cexpr_t* call_expr);
     void process_array_access(cexpr_t* expr);
+
+    void record_bitfield_access(const cexpr_t* expr, sval_t offset, uint32_t size,
+                                const BitfieldInfo& info,
+                                const std::optional<std::uint8_t>& base_indirection);
+    [[nodiscard]] bool extract_access(const cexpr_t* expr, sval_t& offset, uint32_t& size,
+                                      std::optional<std::uint8_t>* base_indirection) const;
+    [[nodiscard]] bool compute_bitfield(std::uint64_t mask, int shift,
+                                        std::uint16_t& bit_offset,
+                                        std::uint16_t& bit_size) const;
+    [[nodiscard]] tinfo_t build_funcptr_type(const cexpr_t* call_expr) const;
 
     [[nodiscard]] bool involves_target_var(const cexpr_t* expr) const;
     [[nodiscard]] SemanticType infer_semantic_from_usage(const cexpr_t* expr, const cexpr_t* parent);
@@ -92,6 +104,47 @@ inline int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
             }
             break;
 
+        case cot_band: {
+            const cexpr_t* mask_expr = nullptr;
+            const cexpr_t* value_expr = nullptr;
+            if (expr->x && expr->x->op == cot_num) {
+                mask_expr = expr->x;
+                value_expr = expr->y;
+            } else if (expr->y && expr->y->op == cot_num) {
+                mask_expr = expr->y;
+                value_expr = expr->x;
+            }
+
+            if (mask_expr && value_expr) {
+                const cexpr_t* base_expr = value_expr;
+                int shift = 0;
+
+                if (base_expr->op == cot_sshr || base_expr->op == cot_ushr) {
+                    if (base_expr->y && base_expr->y->op == cot_num) {
+                        shift = static_cast<int>(base_expr->y->numval());
+                        base_expr = base_expr->x;
+                    }
+                }
+
+                while (base_expr && base_expr->op == cot_cast) {
+                    base_expr = base_expr->x;
+                }
+
+                sval_t offset = 0;
+                uint32_t size = 0;
+                std::optional<std::uint8_t> base_indirection;
+                BitfieldInfo info;
+                if (extract_access(base_expr, offset, size, &base_indirection) &&
+                    compute_bitfield(static_cast<std::uint64_t>(mask_expr->numval()),
+                                     shift, info.bit_offset, info.bit_size)) {
+                    if (static_cast<unsigned>(info.bit_offset + info.bit_size) <= size * 8) {
+                        record_bitfield_access(expr, offset, size, info, base_indirection);
+                    }
+                }
+            }
+            break;
+        }
+
         case cot_call:
             // Check for indirect calls through our variable
             process_call_through_ptr(expr);
@@ -105,7 +158,7 @@ inline int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
 }
 
 inline void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr_t* ptr_expr) {
-    auto arith = utils::extract_ptr_arith(ptr_expr);
+    auto arith = utils::extract_ptr_arith(expr);
 
     if (!arith.valid || arith.var_idx != target_var_idx_) {
         return;
@@ -134,6 +187,10 @@ inline void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr
     const cexpr_t* parent = parent_expr();
     access.semantic_type = infer_semantic_from_usage(expr, parent);
 
+    if (arith.base_indirection > 0) {
+        access.base_indirection = arith.base_indirection;
+    }
+
     // Check for vtable access pattern: *(*var + offset)
     // This is a double dereference where the inner deref is at offset 0
     if (ptr_expr->op == cot_ptr) {
@@ -147,6 +204,7 @@ inline void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr
 
     access.context_expr = utils::expr_to_string(expr, cfunc_);
     access.inferred_type = expr->type;
+    access.source_func_ea = cfunc_->entry_ea;
 
     accesses_.push_back(std::move(access));
 }
@@ -170,8 +228,12 @@ inline void AccessPatternVisitor::process_memptr_access(cexpr_t* expr) {
     access.access_type = determine_access_type(expr);
     const cexpr_t* parent = parent_expr();
     access.semantic_type = infer_semantic_from_usage(expr, parent);
+    if (arith.base_indirection > 0) {
+        access.base_indirection = arith.base_indirection;
+    }
     access.context_expr = utils::expr_to_string(expr, cfunc_);
     access.inferred_type = expr->type;
+    access.source_func_ea = cfunc_->entry_ea;
 
     accesses_.push_back(std::move(access));
 }
@@ -184,10 +246,29 @@ inline void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
 
     // Calculate offset
     sval_t offset = arith.offset;
+    std::optional<std::uint32_t> stride_hint;
+
+    tinfo_t elem_type = expr->type;
+    if (!elem_type.empty()) {
+        size_t elem_size = elem_type.get_size();
+        if (elem_size != BADSIZE && elem_size > 0) {
+            stride_hint = static_cast<std::uint32_t>(elem_size);
+        }
+    }
+
+    if (!stride_hint.has_value()) {
+        tinfo_t ptr_elem = expr->x->type.get_pointed_object();
+        if (!ptr_elem.empty()) {
+            size_t elem_size = ptr_elem.get_size();
+            if (elem_size != BADSIZE && elem_size > 0) {
+                stride_hint = static_cast<std::uint32_t>(elem_size);
+            }
+        }
+    }
+
     if (expr->y->op == cot_num) {
-        tinfo_t elem_type = expr->x->type.get_pointed_object();
-        if (!elem_type.empty()) {
-            offset += expr->y->numval() * elem_type.get_size();
+        if (stride_hint.has_value()) {
+            offset += expr->y->numval() * static_cast<sval_t>(*stride_hint);
         } else {
             offset += expr->y->numval();
         }
@@ -206,8 +287,13 @@ inline void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
     access.access_type = determine_access_type(expr);
     const cexpr_t* parent = parent_expr();
     access.semantic_type = infer_semantic_from_usage(expr, parent);
+    if (arith.base_indirection > 0) {
+        access.base_indirection = arith.base_indirection;
+    }
     access.context_expr = utils::expr_to_string(expr, cfunc_);
     access.inferred_type = expr->type;
+    access.source_func_ea = cfunc_->entry_ea;
+    access.array_stride_hint = stride_hint;
 
     accesses_.push_back(std::move(access));
 }
@@ -218,10 +304,36 @@ inline void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
     cexpr_t* callee = call_expr->x;
     if (!callee) return;
 
+    while (callee->op == cot_cast) {
+        callee = callee->x;
+    }
+
+    tinfo_t funcptr_type = build_funcptr_type(call_expr);
+
+    auto add_fp_access = [&](sval_t offset, SemanticType sem, bool is_vtable, sval_t slot_offset) {
+        FieldAccess access;
+        access.insn_ea = call_expr->ea;
+        access.source_func_ea = cfunc_->entry_ea;
+        access.offset = offset;
+        access.size = get_ptr_size();
+        access.access_type = AccessType::Call;
+        access.semantic_type = sem;
+        access.context_expr = utils::expr_to_string(call_expr, cfunc_);
+        if (!funcptr_type.empty()) {
+            access.inferred_type = funcptr_type;
+        }
+
+        if (is_vtable) {
+            access.is_vtable_access = true;
+            access.vtable_slot = slot_offset / get_ptr_size();
+            access.set_vtable_nested_access(offset, slot_offset, funcptr_type);
+        }
+
+        accesses_.push_back(std::move(access));
+    };
+
     // Pattern 1: Direct call through dereferenced var: (*var)(args)
     // Pattern 2: VTable call: (*(*(type**)var + slot))(args)
-
-    // Check if callee is a dereference
     if (callee->op == cot_ptr) {
         const cexpr_t* ptr = callee->x;
 
@@ -230,7 +342,6 @@ inline void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
             const cexpr_t* base_ptr = ptr;
             sval_t slot_offset = 0;
 
-            // Handle (*(var) + offset) pattern
             if (ptr->op == cot_add) {
                 if (ptr->y->op == cot_num) {
                     slot_offset = ptr->y->numval();
@@ -238,22 +349,10 @@ inline void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
                 base_ptr = ptr->x;
             }
 
-            // Check if base is a dereference of our variable
             if (base_ptr->op == cot_ptr) {
                 auto arith = utils::extract_ptr_arith(base_ptr->x);
                 if (arith.valid && arith.var_idx == target_var_idx_) {
-                    // This is a vtable call!
-                    FieldAccess access;
-                    access.insn_ea = call_expr->ea;
-                    access.offset = arith.offset;  // Offset of vtable pointer
-                    access.size = get_ptr_size();
-                    access.access_type = AccessType::Call;
-                    access.semantic_type = SemanticType::VTablePointer;
-                    access.is_vtable_access = true;
-                    access.vtable_slot = slot_offset / get_ptr_size();
-                    access.context_expr = utils::expr_to_string(call_expr, cfunc_);
-
-                    accesses_.push_back(std::move(access));
+                    add_fp_access(arith.offset, SemanticType::VTablePointer, true, slot_offset);
                     return;
                 }
             }
@@ -262,17 +361,146 @@ inline void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
         // Simple dereference call: (*var)(args)
         auto arith = utils::extract_ptr_arith(ptr);
         if (arith.valid && arith.var_idx == target_var_idx_) {
-            FieldAccess access;
-            access.insn_ea = call_expr->ea;
-            access.offset = arith.offset;
-            access.size = get_ptr_size();
-            access.access_type = AccessType::Call;
-            access.semantic_type = SemanticType::FunctionPointer;
-            access.context_expr = utils::expr_to_string(call_expr, cfunc_);
-
-            accesses_.push_back(std::move(access));
+            add_fp_access(arith.offset, SemanticType::FunctionPointer, false, 0);
+            return;
         }
     }
+
+    // Member function pointer call: obj->fp(args)
+    if (callee->op == cot_memptr || callee->op == cot_memref) {
+        auto arith = utils::extract_ptr_arith(callee->x);
+        if (arith.valid && arith.var_idx == target_var_idx_) {
+            add_fp_access(arith.offset + callee->m, SemanticType::FunctionPointer, false, 0);
+            return;
+        }
+    }
+
+    // Indexed function pointer call: fp_array[idx](args)
+    if (callee->op == cot_idx) {
+        auto arith = utils::extract_ptr_arith(callee->x);
+        if (arith.valid && arith.var_idx == target_var_idx_) {
+            sval_t offset = arith.offset;
+            if (callee->y && callee->y->op == cot_num) {
+                offset += callee->y->numval() * get_ptr_size();
+            }
+            add_fp_access(offset, SemanticType::FunctionPointer, false, 0);
+            return;
+        }
+    }
+}
+
+inline void AccessPatternVisitor::record_bitfield_access(const cexpr_t* expr, sval_t offset,
+                                                        uint32_t size, const BitfieldInfo& info,
+                                                        const std::optional<std::uint8_t>& base_indirection) {
+    FieldAccess access;
+    access.insn_ea = expr->ea;
+    access.source_func_ea = cfunc_->entry_ea;
+    access.offset = offset;
+    access.size = size;
+    access.access_type = AccessType::Read;
+    access.semantic_type = SemanticType::UnsignedInteger;
+    access.context_expr = utils::expr_to_string(expr, cfunc_);
+    access.inferred_type = expr->type;
+    if (base_indirection.has_value()) {
+        access.base_indirection = base_indirection;
+    }
+    access.add_bitfield(info);
+
+    accesses_.push_back(std::move(access));
+}
+
+
+inline bool AccessPatternVisitor::extract_access(const cexpr_t* expr, sval_t& offset, uint32_t& size,
+                                                  std::optional<std::uint8_t>* base_indirection) const {
+    if (base_indirection) {
+        base_indirection->reset();
+    }
+
+    if (!expr) return false;
+
+    if (expr->op == cot_ptr) {
+        auto arith = utils::extract_ptr_arith(expr);
+        if (!arith.valid || arith.var_idx != target_var_idx_) return false;
+        offset = arith.offset;
+        size = expr->type.empty() ? get_ptr_size() : utils::get_type_size(expr->type, get_ptr_size());
+        if (base_indirection && arith.base_indirection > 0) {
+            *base_indirection = arith.base_indirection;
+        }
+        return true;
+    }
+
+    if (expr->op == cot_memptr || expr->op == cot_memref) {
+        auto arith = utils::extract_ptr_arith(expr->x);
+        if (!arith.valid || arith.var_idx != target_var_idx_) return false;
+        offset = arith.offset + expr->m;
+        size = expr->type.empty() ? get_ptr_size() : utils::get_type_size(expr->type, get_ptr_size());
+        if (base_indirection && arith.base_indirection > 0) {
+            *base_indirection = arith.base_indirection;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+inline bool AccessPatternVisitor::compute_bitfield(std::uint64_t mask, int shift,
+                                                   std::uint16_t& bit_offset,
+                                                   std::uint16_t& bit_size) const {
+    if (mask == 0 || shift < 0 || shift > 63) return false;
+
+    int lsb = 0;
+    while (lsb < 64 && ((mask >> lsb) & 1ULL) == 0) {
+        ++lsb;
+    }
+
+    int msb = 63;
+    while (msb >= 0 && ((mask >> msb) & 1ULL) == 0) {
+        --msb;
+    }
+
+    if (lsb > msb) return false;
+
+    int width = msb - lsb + 1;
+    std::uint64_t contig = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
+    if ((mask >> lsb) != contig) return false;
+
+    bit_offset = static_cast<std::uint16_t>(lsb + shift);
+    bit_size = static_cast<std::uint16_t>(width);
+    return bit_size > 0;
+}
+
+inline tinfo_t AccessPatternVisitor::build_funcptr_type(const cexpr_t* call_expr) const {
+    tinfo_t result;
+    if (!call_expr || call_expr->op != cot_call) return result;
+
+    func_type_data_t ftd;
+    if (!call_expr->type.empty()) {
+        ftd.rettype = call_expr->type;
+    } else {
+        ftd.rettype.create_simple_type(BTF_VOID);
+    }
+    ftd.set_cc(CM_CC_UNKNOWN);
+
+    if (call_expr->a) {
+        for (const auto& arg : *call_expr->a) {
+            tinfo_t arg_type = arg.type;
+            if (arg_type.empty()) {
+                tinfo_t void_type;
+                void_type.create_simple_type(BTF_VOID);
+                arg_type.create_ptr(void_type);
+            }
+            funcarg_t farg;
+            farg.type = arg_type;
+            ftd.push_back(farg);
+        }
+    }
+
+    tinfo_t func_type;
+    if (func_type.create_func(ftd)) {
+        result.create_ptr(func_type);
+    }
+
+    return result;
 }
 
 inline bool AccessPatternVisitor::involves_target_var(const cexpr_t* expr) const {
@@ -287,6 +515,8 @@ inline bool AccessPatternVisitor::involves_target_var(const cexpr_t* expr) const
         case cot_cast:
         case cot_ref:
         case cot_ptr:
+        case cot_memref:
+        case cot_memptr:
             return involves_target_var(expr->x);
 
         case cot_add:
@@ -592,6 +822,28 @@ inline void AccessCollector::deduplicate_accesses(AccessPattern& pattern) {
                 // Merge nested info if present
                 if (access.nested_info && !existing.nested_info) {
                     existing.nested_info = access.nested_info;
+                }
+
+                if (!access.bitfields.empty()) {
+                    for (const auto& bf : access.bitfields) {
+                        existing.add_bitfield(bf);
+                    }
+                }
+
+                if (access.array_stride_hint.has_value()) {
+                    if (!existing.array_stride_hint.has_value()) {
+                        existing.array_stride_hint = access.array_stride_hint;
+                    } else if (*existing.array_stride_hint != *access.array_stride_hint) {
+                        existing.array_stride_hint.reset();
+                    }
+                }
+
+                if (access.base_indirection.has_value()) {
+                    if (!existing.base_indirection.has_value()) {
+                        existing.base_indirection = access.base_indirection;
+                    } else if (*existing.base_indirection != *access.base_indirection) {
+                        existing.base_indirection.reset();
+                    }
                 }
 
                 found = true;

@@ -15,6 +15,8 @@
 #include "z3/type_applicator.hpp"
 #include <memory>
 #include <chrono>
+#include <unordered_map>
+#include <unordered_set>
 
 #ifndef STRUCTOR_TESTING
 #include <pro.h>
@@ -22,6 +24,8 @@
 #endif
 
 namespace structor {
+
+struct SubStructInfo;
 
 namespace detail {
     // Helper for conditional logging in header
@@ -38,7 +42,9 @@ namespace detail {
 /// Result of synthesis attempt with detailed metadata
 struct SynthesisResult {
     SynthStruct structure;
+    qvector<SubStructInfo> sub_structs;
     qvector<AccessConflict> conflicts;
+
 
     // Synthesis metadata
     bool used_z3 = false;
@@ -111,6 +117,7 @@ struct LayoutSynthConfig {
     int cross_function_depth = 5;
     int max_functions = 100;
     bool track_pointer_deltas = true;
+    bool emit_substructs = true;
 
     // Array detection
     int min_array_elements = 3;
@@ -249,6 +256,10 @@ private:
     );
     void generate_field_names(SynthStruct& result);
     void compute_struct_size(SynthStruct& result);
+    void detect_subobjects(const UnifiedAccessPattern& pattern,
+                           const SynthOptions& opts,
+                           SynthesisResult& result);
+    void apply_bitfield_recovery(const UnifiedAccessPattern& pattern, SynthStruct& result);
 
     [[nodiscard]] tinfo_t select_best_type(const qvector<FieldAccess>& accesses);
     [[nodiscard]] SemanticType select_best_semantic(const qvector<FieldAccess>& accesses);
@@ -272,6 +283,7 @@ inline LayoutSynthesizer::LayoutSynthesizer(const SynthOptions& opts)
     config_.default_alignment = opts.alignment;
     config_.cross_function = opts.propagate_to_callees || opts.propagate_to_callers;
     config_.cross_function_depth = opts.max_propagation_depth;
+    config_.emit_substructs = opts.emit_substructs;
     config_.weight_minimize_padding = opts.z3.weight_minimize_padding;
     config_.weight_prefer_non_union = opts.z3.weight_prefer_non_union;
 }
@@ -325,6 +337,11 @@ inline SynthesisResult LayoutSynthesizer::synthesize(
     synth_result.structure.source_var = pattern.var_name;
     synth_result.structure.name = generate_struct_name(pattern.func_ea);
     synth_result.functions_analyzed = result.functions_analyzed;
+
+    if (config_.emit_substructs) {
+        detect_subobjects(unified_pattern, opts, synth_result);
+    }
+    apply_bitfield_recovery(unified_pattern, synth_result.structure);
 
     auto end_time = std::chrono::steady_clock::now();
     synth_result.synthesis_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -853,6 +870,212 @@ inline void LayoutSynthesizer::compute_struct_size(SynthStruct& result) {
     result.size = align_offset(end, result.alignment);
 }
 
+inline void LayoutSynthesizer::apply_bitfield_recovery(
+    const UnifiedAccessPattern& pattern,
+    SynthStruct& result)
+{
+    if (pattern.all_accesses.empty() || result.fields.empty()) return;
+
+    std::unordered_map<uint64_t, qvector<BitfieldInfo>> by_field;
+    for (const auto& access : pattern.all_accesses) {
+        if (access.bitfields.empty()) continue;
+        uint64_t key = (static_cast<uint64_t>(access.offset) << 32) |
+                       static_cast<uint64_t>(access.size);
+        auto& list = by_field[key];
+        for (const auto& bf : access.bitfields) {
+            bool found = false;
+            for (const auto& existing : list) {
+                if (existing == bf) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                list.push_back(bf);
+            }
+        }
+    }
+
+    if (by_field.empty()) return;
+
+    auto make_base_type = [](uint32_t size) {
+        tinfo_t type;
+        switch (size) {
+            case 1: type.create_simple_type(BT_INT8 | BTMT_USIGNED); break;
+            case 2: type.create_simple_type(BT_INT16 | BTMT_USIGNED); break;
+            case 4: type.create_simple_type(BT_INT32 | BTMT_USIGNED); break;
+            case 8: type.create_simple_type(BT_INT64 | BTMT_USIGNED); break;
+            default: type.create_simple_type(BT_INT8 | BTMT_USIGNED); break;
+        }
+        return type;
+    };
+
+    qvector<SynthField> updated;
+    updated.reserve(result.fields.size());
+
+    for (const auto& field : result.fields) {
+        uint64_t key = (static_cast<uint64_t>(field.offset) << 32) |
+                       static_cast<uint64_t>(field.size);
+        auto it = by_field.find(key);
+        if (it == by_field.end() || field.is_padding || field.is_array || field.is_union_candidate) {
+            updated.push_back(field);
+            continue;
+        }
+
+        const auto& bfs = it->second;
+        bool valid = true;
+        for (const auto& bf : bfs) {
+            if (static_cast<unsigned>(bf.bit_offset + bf.bit_size) > field.size * 8) {
+                valid = false;
+                break;
+            }
+        }
+
+        if (!valid || bfs.empty()) {
+            updated.push_back(field);
+            continue;
+        }
+
+        for (const auto& bf : bfs) {
+            SynthField bf_field = SynthField::create_bitfield(
+                field.offset, field.size, bf.bit_offset, bf.bit_size);
+            bf_field.type = field.type.empty() ? make_base_type(field.size) : field.type;
+            updated.push_back(std::move(bf_field));
+        }
+    }
+
+    std::sort(updated.begin(), updated.end(), [](const SynthField& a, const SynthField& b) {
+        if (a.offset != b.offset) return a.offset < b.offset;
+        if (a.is_bitfield != b.is_bitfield) return a.is_bitfield;
+        return a.bit_offset < b.bit_offset;
+    });
+
+    result.fields = std::move(updated);
+    compute_struct_size(result);
+}
+
+inline void LayoutSynthesizer::detect_subobjects(
+    const UnifiedAccessPattern& pattern,
+    const SynthOptions& opts,
+    SynthesisResult& result)
+{
+    if (!config_.emit_substructs || !config_.cross_function) return;
+    if (pattern.per_function_patterns.empty()) return;
+
+    struct SubGroup {
+        sval_t offset = 0;
+        qvector<AccessPattern> patterns;
+        std::unordered_set<ea_t> funcs;
+    };
+
+    std::unordered_map<sval_t, SubGroup> groups;
+    for (const auto& fn_pattern : pattern.per_function_patterns) {
+        auto it = pattern.function_deltas.find(fn_pattern.func_ea);
+        sval_t delta = it != pattern.function_deltas.end() ? it->second : 0;
+        if (delta <= 0) continue;
+
+        auto& group = groups[delta];
+        group.offset = delta;
+        group.patterns.push_back(fn_pattern);
+        group.funcs.insert(fn_pattern.func_ea);
+    }
+
+    if (groups.empty()) return;
+
+    LayoutSynthConfig sub_config = config_;
+    sub_config.cross_function = false;
+    sub_config.emit_substructs = false;
+
+    LayoutSynthesizer sub_synth(sub_config);
+
+    for (auto& [delta, group] : groups) {
+        AccessPattern sub_pattern;
+        sub_pattern.func_ea = group.patterns.front().func_ea;
+        sub_pattern.var_name.sprnt("sub_%llX", static_cast<unsigned long long>(delta));
+
+        for (const auto& fn_pattern : group.patterns) {
+            for (const auto& access : fn_pattern.accesses) {
+                sub_pattern.add_access(FieldAccess(access));
+            }
+        }
+
+        if (sub_pattern.accesses.empty() ||
+            static_cast<int>(sub_pattern.access_count()) < opts.min_accesses) {
+            continue;
+        }
+
+        SynthesisResult sub_result = sub_synth.synthesize(sub_pattern, opts);
+        if (!sub_result.success()) continue;
+
+        std::uint32_t sub_size = sub_result.structure.size;
+        if (sub_size == 0) continue;
+
+        sval_t sub_end = delta + static_cast<sval_t>(sub_size);
+        bool conflict = false;
+        qvector<size_t> remove_indices;
+
+        for (size_t i = 0; i < result.structure.fields.size(); ++i) {
+            const auto& field = result.structure.fields[i];
+            sval_t field_end = field.offset + static_cast<sval_t>(field.size);
+
+            if (field_end <= delta || field.offset >= sub_end) {
+                continue;
+            }
+
+            bool removable = !field.source_accesses.empty();
+            if (removable) {
+                for (const auto& access : field.source_accesses) {
+                    if (group.funcs.count(access.source_func_ea) == 0) {
+                        removable = false;
+                        break;
+                    }
+                }
+            }
+
+            if (removable) {
+                remove_indices.push_back(i);
+            } else {
+                conflict = true;
+                break;
+            }
+        }
+
+        if (conflict) {
+            continue;
+        }
+
+        // Remove in reverse order to keep indices valid
+        for (size_t idx = remove_indices.size(); idx > 0; --idx) {
+            size_t remove_idx = remove_indices[idx - 1];
+            result.structure.fields.erase(result.structure.fields.begin() + static_cast<sval_t>(remove_idx));
+        }
+
+        SynthField sub_field;
+        sub_field.offset = delta;
+        sub_field.size = sub_size;
+        sub_field.semantic = SemanticType::NestedStruct;
+        sub_field.confidence = TypeConfidence::Medium;
+        sub_field.name.sprnt("sub_%X", static_cast<unsigned>(delta));
+
+        result.structure.fields.push_back(sub_field);
+
+        SubStructInfo info;
+        info.structure = std::move(sub_result.structure);
+        info.parent_offset = delta;
+        info.field_name = sub_field.name;
+        result.sub_structs.push_back(std::move(info));
+    }
+
+    std::sort(result.structure.fields.begin(), result.structure.fields.end(),
+              [](const SynthField& a, const SynthField& b) {
+                  if (a.offset != b.offset) return a.offset < b.offset;
+                  if (a.is_bitfield != b.is_bitfield) return a.is_bitfield;
+                  return a.bit_offset < b.bit_offset;
+              });
+
+    compute_struct_size(result.structure);
+}
+
 inline tinfo_t LayoutSynthesizer::select_best_type(const qvector<FieldAccess>& accesses) {
     tinfo_t best;
 
@@ -1040,7 +1263,10 @@ inline z3::TypeApplicationResult LayoutSynthesizer::apply_synthesis_result(
     // Step 1: Create and persist the synthesized structure
     StructurePersistence persistence;
     SynthStruct synth_copy = result.structure;  // create_struct may modify the name
-    tid_t struct_tid = persistence.create_struct(synth_copy);
+    qvector<SubStructInfo> sub_structs = result.sub_structs;
+    tid_t struct_tid = sub_structs.empty()
+        ? persistence.create_struct(synth_copy)
+        : persistence.create_struct_with_substructs(synth_copy, sub_structs);
     
     if (struct_tid == BADADDR) {
         detail::synth_log("[Structor] Failed to create structure in IDA\n");

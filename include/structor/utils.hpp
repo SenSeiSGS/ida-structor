@@ -103,9 +103,10 @@ namespace utils {
 struct PtrArithInfo {
     int         var_idx;
     sval_t      offset;
+    std::uint8_t base_indirection;  // Number of deref steps before base var
     bool        valid;
 
-    PtrArithInfo() : var_idx(-1), offset(0), valid(false) {}
+    PtrArithInfo() : var_idx(-1), offset(0), base_indirection(0), valid(false) {}
 };
 
 [[nodiscard]] inline PtrArithInfo extract_ptr_arith(const cexpr_t* expr, int depth = 0) {
@@ -125,8 +126,16 @@ struct PtrArithInfo {
         return info;
     }
 
-    // Cast/address-of/deref expressions - recurse
-    if (expr->op == cot_cast || expr->op == cot_ref || expr->op == cot_ptr || expr->op == cot_memref) {
+    if (expr->op == cot_ptr) {
+        info = extract_ptr_arith(expr->x, depth + 1);
+        if (info.valid && info.base_indirection < 0xFF) {
+            ++info.base_indirection;
+        }
+        return info;
+    }
+
+    // Cast/address-of/field access expressions - recurse
+    if (expr->op == cot_cast || expr->op == cot_ref || expr->op == cot_memref) {
         return extract_ptr_arith(expr->x, depth + 1);
     }
 

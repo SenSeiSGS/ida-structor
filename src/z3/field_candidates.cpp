@@ -352,6 +352,14 @@ void FieldCandidateGenerator::finalize_candidates(qvector<FieldCandidate>& candi
 }
 
 TypeCategory FieldCandidateGenerator::infer_category(const FieldAccess& access) const {
+    // Prefer explicit function pointer types from inference
+    if (!access.inferred_type.empty()) {
+        TypeCategory inferred = ctx_.type_encoder().categorize(access.inferred_type);
+        if (inferred == TypeCategory::FuncPtr) {
+            return inferred;
+        }
+    }
+
     // First check semantic type
     switch (access.semantic_type) {
         case SemanticType::Pointer:

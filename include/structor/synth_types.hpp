@@ -82,6 +82,21 @@ enum class SemanticType : std::uint8_t {
     Padding
 };
 
+/// Bitfield access information
+struct BitfieldInfo {
+    std::uint16_t bit_offset = 0;
+    std::uint16_t bit_size = 0;
+
+    BitfieldInfo() = default;
+    BitfieldInfo(std::uint16_t off, std::uint16_t sz)
+        : bit_offset(off)
+        , bit_size(sz) {}
+
+    bool operator==(const BitfieldInfo& other) const noexcept {
+        return bit_offset == other.bit_offset && bit_size == other.bit_size;
+    }
+};
+
 /// Nested access information for multi-level structure recovery (adopted from Suture)
 /// Represents a path through nested structures: obj->field->nested_field
 /// Example: AccessInfo(0, AccessInfo(8, type)) means obj->vtable[1] (vtable at offset 0, slot at offset 8)
@@ -149,6 +164,7 @@ struct NestedAccessInfo {
 /// Represents a single observed access to a structure field
 struct FieldAccess {
     ea_t            insn_ea;        // Instruction address where access occurs
+    ea_t            source_func_ea; // Function where access occurs
     sval_t          offset;         // Offset from base pointer
     std::uint32_t   size;           // Size of access in bytes
     AccessType      access_type;    // Read/Write/Call
@@ -159,11 +175,21 @@ struct FieldAccess {
     sval_t          vtable_slot;    // If vtable access, which slot
     bool            is_zero_init;   // True if this is a zero-initialization write (e.g., memset to 0)
 
+    // Bitfield observations for this access (if any)
+    qvector<BitfieldInfo> bitfields;
+
+    // Array stride hint derived from index expressions (if any)
+    std::optional<std::uint32_t> array_stride_hint;
+
+    // Extra deref levels before reaching base var (e.g., *param = 1)
+    std::optional<std::uint8_t> base_indirection;
+
     // Nested access support (adopted from Suture)
     std::optional<NestedAccessInfo> nested_info;  // For multi-level accesses like obj->vtable[slot]
 
     FieldAccess()
         : insn_ea(BADADDR)
+        , source_func_ea(BADADDR)
         , offset(0)
         , size(0)
         , access_type(AccessType::Unknown)
@@ -199,6 +225,15 @@ struct FieldAccess {
         nested_info = NestedAccessInfo(vtable_offset, NestedAccessInfo(slot_offset, slot_type));
         is_vtable_access = true;
         vtable_slot = slot_offset / (inf_is_64bit() ? 8 : 4);
+    }
+
+    void add_bitfield(const BitfieldInfo& info) {
+        for (const auto& existing : bitfields) {
+            if (existing == info) {
+                return;
+            }
+        }
+        bitfields.push_back(info);
     }
 };
 
@@ -277,6 +312,9 @@ struct SynthField {
     bool            is_union_candidate;  // True if overlapping accesses detected
     bool            is_array;       // True if this is an array field
     std::uint32_t   array_count;    // Number of array elements (1 if not array)
+    bool            is_bitfield;    // True if this is a bitfield member
+    std::uint16_t   bit_offset;     // Bit offset within the storage unit
+    std::uint16_t   bit_size;       // Bit size of the bitfield
     TypeConfidence  confidence;     // How confident we are in the type
     qvector<FieldAccess> source_accesses;  // Accesses that contributed to this field
 
@@ -288,6 +326,9 @@ struct SynthField {
         , is_union_candidate(false)
         , is_array(false)
         , array_count(1)
+        , is_bitfield(false)
+        , bit_offset(0)
+        , bit_size(0)
         , confidence(TypeConfidence::Medium) {}
 
     static SynthField create_padding(sval_t off, std::uint32_t sz) {
@@ -346,6 +387,21 @@ struct SynthField {
         f.confidence = TypeConfidence::Medium;
         f.semantic = SemanticType::Array;
 
+        return f;
+    }
+
+    /// Create a bitfield member
+    static SynthField create_bitfield(sval_t off, std::uint32_t storage_size,
+                                      std::uint16_t bit_off, std::uint16_t bit_sz) {
+        SynthField f;
+        f.offset = off;
+        f.size = storage_size;
+        f.is_bitfield = true;
+        f.bit_offset = bit_off;
+        f.bit_size = bit_sz;
+        f.semantic = SemanticType::UnsignedInteger;
+        f.confidence = TypeConfidence::Medium;
+        f.name.sprnt("bf_%X_%u", static_cast<unsigned>(off), static_cast<unsigned>(bit_off));
         return f;
     }
 };
@@ -413,6 +469,13 @@ struct SynthStruct {
             provenance.push_back(func_ea);
         }
     }
+};
+
+/// Information about a detected sub-structure embedded in a parent struct
+struct SubStructInfo {
+    SynthStruct     structure;
+    sval_t          parent_offset = 0;
+    qstring         field_name;
 };
 
 // ============================================================================

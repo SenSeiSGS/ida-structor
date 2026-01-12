@@ -701,9 +701,8 @@ private:
     );
     
     /// Find all callees where var is passed as an argument
-    /// Returns: vector of (callee_ea, param_idx, delta) tuples
-    /// delta is the constant offset added to var before passing
-    [[nodiscard]] qvector<std::tuple<ea_t, int, sval_t>> find_callees_with_arg(
+    /// Returns call infos with callee, delta, and by-ref metadata
+    [[nodiscard]] qvector<CalleeCallInfo> find_callees_with_arg(
         cfunc_t* cfunc, 
         int var_idx
     );
@@ -716,7 +715,8 @@ private:
     );
     
     /// Find all callers that pass a value to this function's parameter
-    [[nodiscard]] qvector<std::pair<ea_t, int>> find_callers_with_param(
+    /// Returns call infos with caller var, delta, and by-ref metadata
+    [[nodiscard]] qvector<CallerCallInfo> find_callers_with_param(
         ea_t func_ea, 
         int param_idx
     );

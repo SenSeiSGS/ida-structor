@@ -45,7 +45,8 @@ namespace {
 
 SynthField field_from_candidate(
     const FieldCandidate& candidate,
-    TypeEncoder& type_encoder)
+    TypeEncoder& type_encoder,
+    const qvector<FieldAccess>* access_list)
 {
     SynthField field;
     field.offset = candidate.offset;
@@ -84,6 +85,14 @@ SynthField field_from_candidate(
         array_type.create_array(field.type, *candidate.array_element_count);
         field.type = array_type;
         field.size = candidate.array_stride.value_or(candidate.size) * *candidate.array_element_count;
+    }
+
+    if (access_list) {
+        for (int idx : candidate.source_access_indices) {
+            if (idx >= 0 && static_cast<size_t>(idx) < access_list->size()) {
+                field.source_accesses.push_back(access_list->at(static_cast<size_t>(idx)));
+            }
+        }
     }
 
     return field;
@@ -918,7 +927,8 @@ SynthStruct LayoutConstraintBuilder::extract_struct(const ::z3::model& model) {
         } else {
             // Regular field
             z3_log("[Structor/Z3]       -> Adding as regular field\n");
-            SynthField field = field_from_candidate(candidate, ctx_.type_encoder());
+            SynthField field = field_from_candidate(candidate, ctx_.type_encoder(),
+                                                     pattern_ ? &pattern_->all_accesses : nullptr);
             z3_log("[Structor/Z3]       -> Created field: name='%s', offset=0x%llX, size=%u\n",
                    field.name.c_str(), static_cast<unsigned long long>(field.offset), field.size);
             result.fields.push_back(std::move(field));
@@ -1022,7 +1032,8 @@ void LayoutConstraintBuilder::detect_union_groups(const ::z3::model& model) {
         // Create alternative fields
         for (int idx : members) {
             const auto& cand = candidates_[field_vars_[idx].candidate_id];
-            resolution.alternatives.push_back(field_from_candidate(cand, ctx_.type_encoder()));
+            resolution.alternatives.push_back(field_from_candidate(cand, ctx_.type_encoder(),
+                                                                    pattern_ ? &pattern_->all_accesses : nullptr));
         }
 
         union_resolutions_.push_back(std::move(resolution));

@@ -64,6 +64,26 @@ struct PointerFlowEdge {
         , is_direct_call(true) {}
 };
 
+/// Call site metadata for cross-function flow
+struct CalleeCallInfo {
+    ea_t call_ea = BADADDR;
+    ea_t callee_ea = BADADDR;
+    int arg_idx = -1;
+    sval_t delta = 0;
+    bool is_direct = false;
+    bool by_ref = false;
+    tinfo_t funcptr_type;
+};
+
+/// Caller metadata for backward flow
+struct CallerCallInfo {
+    ea_t call_ea = BADADDR;
+    ea_t caller_ea = BADADDR;
+    int var_idx = -1;
+    sval_t delta = 0;
+    bool by_ref = false;
+};
+
 /// Represents a set of variables across functions that share the same underlying type
 struct TypeEquivalenceClass {
     qvector<FunctionVariable> variables;
@@ -205,9 +225,8 @@ public:
     [[nodiscard]] const CrossFunctionStats& stats() const noexcept { return stats_; }
 
     /// Find all callees where var is passed as an argument
-    /// Returns: vector of (callee_ea, param_idx, delta) tuples
-    /// delta is the constant offset added to var before passing
-    [[nodiscard]] qvector<std::tuple<ea_t, int, sval_t>> find_callees_with_arg(
+    /// Returns: vector of call site infos (callee, arg index, delta, by-ref)
+    [[nodiscard]] qvector<CalleeCallInfo> find_callees_with_arg(
         cfunc_t* cfunc,
         int var_idx
     );
@@ -220,8 +239,8 @@ public:
     );
 
     /// Find all callers that pass a value to this function's parameter
-    /// Returns tuples of (caller_ea, var_idx, delta) where delta is the pointer offset
-    [[nodiscard]] qvector<std::tuple<ea_t, int, sval_t>> find_callers_with_param(
+    /// Returns call infos with caller var, delta, and by-ref metadata
+    [[nodiscard]] qvector<CallerCallInfo> find_callers_with_param(
         ea_t func_ea,
         int param_idx
     );
@@ -246,6 +265,9 @@ private:
 
     // Visited set to prevent infinite recursion
     std::unordered_set<FunctionVariable, FunctionVariableHash> visited_;
+
+    // Tracks base-indirection adjustments applied per function variable
+    std::unordered_set<FunctionVariable, FunctionVariableHash> base_indirection_adjusted_;
 
     // Accumulated deltas for each function variable
     std::unordered_map<FunctionVariable, sval_t, FunctionVariableHash> deltas_;
@@ -313,13 +335,17 @@ public:
     /// Check if the target variable was found
     [[nodiscard]] bool found() const noexcept { return found_; }
 
+    /// Check if the target variable was passed by reference
+    [[nodiscard]] bool by_ref() const noexcept { return by_ref_; }
+
 private:
     int target_var_idx_;
     std::optional<sval_t> delta_;
     bool found_ = false;
+    bool by_ref_ = false;
 
     /// Check if an expression is a reference to target variable
-    [[nodiscard]] bool is_target_var(cexpr_t* e) const noexcept;
+    [[nodiscard]] bool is_target_var(cexpr_t* e) noexcept;
 };
 
 /// Expression visitor for finding call sites that pass a specific variable
@@ -336,6 +362,16 @@ public:
         int arg_idx;            // Argument index where variable is passed
         sval_t delta;           // Delta applied to variable (0 if none)
         bool is_direct;         // True if direct call
+        bool by_ref;            // True if argument is passed by reference
+        tinfo_t funcptr_type;   // Inferred function pointer type (if any)
+
+        CallInfo()
+            : call_ea(BADADDR)
+            , callee_ea(BADADDR)
+            , arg_idx(-1)
+            , delta(0)
+            , is_direct(false)
+            , by_ref(false) {}
     };
 
     /// Get all found call sites
@@ -361,16 +397,15 @@ public:
     CallerFinder(ea_t target_func, int param_idx);
 
     /// Find all callers and their corresponding variables with pointer deltas
-    /// Returns tuples of (caller_ea, var_idx, delta) where delta is the offset
-    /// added to the variable before passing (e.g., (char*)ptr + 0x10 has delta 0x10)
-    [[nodiscard]] qvector<std::tuple<ea_t, int, sval_t>> find_callers();
+    /// Returns caller metadata with delta and by-ref information
+    [[nodiscard]] qvector<CallerCallInfo> find_callers();
 
 private:
     ea_t target_func_;
     int param_idx_;
 
     /// Process a single caller function
-    void process_caller(ea_t caller_ea, ea_t call_site, qvector<std::tuple<ea_t, int, sval_t>>& result);
+    void process_caller(ea_t caller_ea, ea_t call_site, qvector<CallerCallInfo>& result);
 };
 
 } // namespace structor
