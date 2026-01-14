@@ -5,8 +5,10 @@
 #include <structor/config.hpp>
 #include <structor/ui_integration.hpp>
 #include <structor/api.hpp>
+#include <structor/type_fixer.hpp>
 #include <expr.hpp>
 #include <auto.hpp>
+#include <unordered_set>
 
 namespace structor {
 
@@ -85,10 +87,89 @@ static error_t idaapi idc_structor_get_vtable_tid(idc_value_t* /*argv*/, idc_val
     return eOk;
 }
 
+// Thread-local storage for type fix results
+static thread_local int g_last_fix_count = 0;
+static thread_local int g_last_fix_applied = 0;
+static thread_local int g_last_fix_skipped = 0;
+
+// IDC function: structor_fix_function_types(func_ea) -> long (number of fixes applied)
+static error_t idaapi idc_structor_fix_function_types(idc_value_t* argv, idc_value_t* res) {
+    ea_t func_ea = argv[0].vtype == VT_INT64 ? argv[0].i64 : static_cast<ea_t>(argv[0].num);
+
+    TypeFixResult result = StructorAPI::instance().fix_function_types(func_ea);
+
+    // Store results for helper functions
+    g_last_error = result.errors.empty() ? qstring() : result.errors[0];
+    g_last_fix_count = result.analyzed;
+    g_last_fix_applied = result.fixes_applied;
+    g_last_fix_skipped = result.fixes_skipped;
+
+    res->set_long(result.fixes_applied);
+    return eOk;
+}
+
+// IDC function: structor_fix_variable_type(func_ea, var_idx) -> long (1 if fixed, 0 otherwise)
+static error_t idaapi idc_structor_fix_variable_type(idc_value_t* argv, idc_value_t* res) {
+    ea_t func_ea = argv[0].vtype == VT_INT64 ? argv[0].i64 : static_cast<ea_t>(argv[0].num);
+    int var_idx = static_cast<int>(argv[1].num);
+
+    VariableTypeFix result = StructorAPI::instance().fix_variable_type(func_ea, var_idx);
+
+    g_last_error = result.skip_reason;
+    res->set_long(result.applied ? 1 : 0);
+    return eOk;
+}
+
+// IDC function: structor_fix_variable_by_name(func_ea, var_name) -> long (1 if fixed, 0 otherwise)
+static error_t idaapi idc_structor_fix_variable_by_name(idc_value_t* argv, idc_value_t* res) {
+    ea_t func_ea = argv[0].vtype == VT_INT64 ? argv[0].i64 : static_cast<ea_t>(argv[0].num);
+    const char* var_name = argv[1].c_str();
+
+    VariableTypeFix result = StructorAPI::instance().fix_variable_type(func_ea, var_name);
+
+    g_last_error = result.skip_reason;
+    res->set_long(result.applied ? 1 : 0);
+    return eOk;
+}
+
+// IDC function: structor_analyze_function_types(func_ea) -> long (number of differences found)
+static error_t idaapi idc_structor_analyze_function_types(idc_value_t* argv, idc_value_t* res) {
+    ea_t func_ea = argv[0].vtype == VT_INT64 ? argv[0].i64 : static_cast<ea_t>(argv[0].num);
+
+    TypeFixResult result = StructorAPI::instance().analyze_function_types(func_ea);
+
+    g_last_error = result.errors.empty() ? qstring() : result.errors[0];
+    g_last_fix_count = result.analyzed;
+    g_last_fix_applied = result.differences_found;
+    g_last_fix_skipped = 0;
+
+    res->set_long(result.differences_found);
+    return eOk;
+}
+
+// IDC function: structor_get_fix_count() -> long
+static error_t idaapi idc_structor_get_fix_count(idc_value_t* /*argv*/, idc_value_t* res) {
+    res->set_long(g_last_fix_count);
+    return eOk;
+}
+
+// IDC function: structor_get_fixes_applied() -> long
+static error_t idaapi idc_structor_get_fixes_applied(idc_value_t* /*argv*/, idc_value_t* res) {
+    res->set_long(g_last_fix_applied);
+    return eOk;
+}
+
+// IDC function: structor_get_fixes_skipped() -> long
+static error_t idaapi idc_structor_get_fixes_skipped(idc_value_t* /*argv*/, idc_value_t* res) {
+    res->set_long(g_last_fix_skipped);
+    return eOk;
+}
+
 // Argument type arrays for IDC functions
 static const char args_synthesize[] = { VT_INT64, VT_LONG, 0 };
 static const char args_synthesize_by_name[] = { VT_INT64, VT_STR, 0 };
 static const char args_no_args[] = { 0 };
+static const char args_func_ea[] = { VT_INT64, 0 };
 
 static const ext_idcfunc_t idc_funcs[] = {
     { "structor_synthesize", idc_structor_synthesize, args_synthesize, nullptr, 0, EXTFUN_BASE },
@@ -96,6 +177,14 @@ static const ext_idcfunc_t idc_funcs[] = {
     { "structor_get_error", idc_structor_get_error, args_no_args, nullptr, 0, EXTFUN_BASE },
     { "structor_get_field_count", idc_structor_get_field_count, args_no_args, nullptr, 0, EXTFUN_BASE },
     { "structor_get_vtable_tid", idc_structor_get_vtable_tid, args_no_args, nullptr, 0, EXTFUN_BASE },
+    // Type fixing functions
+    { "structor_fix_function_types", idc_structor_fix_function_types, args_func_ea, nullptr, 0, EXTFUN_BASE },
+    { "structor_fix_variable_type", idc_structor_fix_variable_type, args_synthesize, nullptr, 0, EXTFUN_BASE },
+    { "structor_fix_variable_by_name", idc_structor_fix_variable_by_name, args_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
+    { "structor_analyze_function_types", idc_structor_analyze_function_types, args_func_ea, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fix_count", idc_structor_get_fix_count, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fixes_applied", idc_structor_get_fixes_applied, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fixes_skipped", idc_structor_get_fixes_skipped, args_no_args, nullptr, 0, EXTFUN_BASE },
 };
 
 static void register_idc_funcs() {
@@ -110,6 +199,9 @@ static void unregister_idc_funcs() {
     }
 }
 
+// Hex-Rays callback for automatic type fixing
+static ssize_t idaapi hexrays_callback(void* ud, hexrays_event_t event, va_list va);
+
 /// Plugin descriptor - owns the action handler to ensure proper lifetime
 class StructorPlugin : public plugmod_t, public event_listener_t {
 public:
@@ -119,6 +211,9 @@ public:
     bool idaapi run(size_t arg) override;
     ssize_t idaapi on_event(ssize_t code, va_list va) override;
 
+    /// Called when decompilation completes - fix types automatically
+    void on_decompilation_complete(cfunc_t* cfunc);
+
 private:
     void cleanup();
     void run_pending_auto_synth();
@@ -126,6 +221,10 @@ private:
     SynthActionHandler action_handler_;  // Owned by plugin, passed to IDA
     bool initialized_ = false;
     bool cleaned_up_ = false;
+    bool hexrays_hooked_ = false;
+
+    // Track which functions we've already processed to avoid re-fixing
+    std::unordered_set<ea_t> processed_functions_;
 
     // Pending auto-synthesis from env var
     ea_t pending_synth_ea_ = BADADDR;
@@ -133,7 +232,33 @@ private:
     bool auto_synth_done_ = false;
 };
 
+// Global plugin instance for callback access
+static StructorPlugin* g_plugin = nullptr;
+
+// Hex-Rays callback implementation
+static ssize_t idaapi hexrays_callback(void* /*ud*/, hexrays_event_t event, va_list va) {
+    if (!g_plugin) return 0;
+    
+    switch (event) {
+        case hxe_func_printed: {
+            // Called after the function pseudocode is generated
+            cfunc_t* cfunc = va_arg(va, cfunc_t*);
+            if (cfunc && Config::instance().options().auto_fix_types) {
+                g_plugin->on_decompilation_complete(cfunc);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    
+    return 0;
+}
+
 StructorPlugin::StructorPlugin() {
+    // Set global plugin pointer for callback access
+    g_plugin = this;
+
     // Load configuration
     Config::instance().load();
 
@@ -142,6 +267,15 @@ StructorPlugin::StructorPlugin() {
 
     // Hook UI notifications to cleanup before widget destruction
     hook_event_listener(HT_UI, this);
+
+    // Install Hex-Rays callback for automatic type fixing
+    if (install_hexrays_callback(hexrays_callback, nullptr)) {
+        hexrays_hooked_ = true;
+        msg("Structor: Hex-Rays callback installed (auto_fix_types=%s)\n",
+            Config::instance().options().auto_fix_types ? "true" : "false");
+    } else {
+        msg("Structor: Failed to install Hex-Rays callback\n");
+    }
 
     // Initialize UI - pass our action handler which we own
     if (ui::initialize(&action_handler_)) {
@@ -207,6 +341,15 @@ void StructorPlugin::cleanup() {
     if (cleaned_up_) return;
     cleaned_up_ = true;
 
+    // Remove Hex-Rays callback
+    if (hexrays_hooked_) {
+        remove_hexrays_callback(hexrays_callback, nullptr);
+        hexrays_hooked_ = false;
+    }
+
+    // Clear global plugin pointer
+    g_plugin = nullptr;
+
     // Unregister IDC functions
     unregister_idc_funcs();
 
@@ -231,6 +374,65 @@ ssize_t StructorPlugin::on_event(ssize_t code, va_list /*va*/) {
             break;
     }
     return 0;
+}
+
+void StructorPlugin::on_decompilation_complete(cfunc_t* cfunc) {
+    if (!cfunc) return;
+
+    ea_t func_ea = cfunc->entry_ea;
+
+    // Check if we've already processed this function
+    if (processed_functions_.count(func_ea) > 0) {
+        return;
+    }
+
+    // Mark as processed to avoid re-processing
+    processed_functions_.insert(func_ea);
+
+    // Debug: always log that we're processing
+    if (Config::instance().options().debug_mode) {
+        qstring func_name;
+        get_func_name(&func_name, func_ea);
+        msg("Structor: Processing function %s (0x%llx)\n", 
+            func_name.c_str(), (unsigned long long)func_ea);
+    }
+
+    // Run type fixer
+    TypeFixerConfig fix_config;
+    fix_config.dry_run = false;
+    fix_config.synthesize_structures = true;
+    fix_config.propagate_fixes = Config::instance().options().auto_propagate;
+    fix_config.max_propagation_depth = Config::instance().options().max_propagation_depth;
+
+    TypeFixer fixer(fix_config);
+    TypeFixResult result = fixer.fix_function_types(cfunc);
+
+    // Report results
+    bool verbose = Config::instance().options().auto_fix_verbose;
+    bool debug = Config::instance().options().debug_mode;
+    
+    if (debug) {
+        msg("Structor: %s - analyzed %u vars, %u differences, %u fixed\n",
+            result.func_name.c_str(),
+            result.analyzed,
+            result.differences_found,
+            result.fixes_applied);
+    }
+    
+    if (verbose && result.fixes_applied > 0) {
+        msg("Structor: Auto-fixed %u types in %s\n",
+            result.fixes_applied, 
+            result.func_name.c_str());
+
+        // Report individual fixes
+        for (const auto& fix : result.variable_fixes) {
+            if (fix.applied) {
+                msg("  - %s: %s\n", 
+                    fix.var_name.c_str(),
+                    fix.comparison.description.c_str());
+            }
+        }
+    }
 }
 
 bool StructorPlugin::run(size_t arg) {

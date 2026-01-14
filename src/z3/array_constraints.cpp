@@ -1,6 +1,7 @@
 #include "structor/z3/array_constraints.hpp"
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 namespace structor::z3 {
 
@@ -279,6 +280,7 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
         });
 
     qvector<ArrayCandidate> merged;
+    merged.reserve(candidates.size());  // Reserve to avoid reallocations
     merged.push_back(candidates[0]);
 
     for (size_t i = 1; i < candidates.size(); ++i) {
@@ -296,16 +298,16 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
                 (new_end - last.base_offset) / last.stride);
             last.element_count = new_count;
 
-            // Merge member offsets
+            // Merge member offsets using hash-based deduplication
+            // Build hash set of existing offsets for O(1) lookup
+            std::unordered_set<sval_t> existing_offsets(
+                last.member_offsets.begin(), 
+                last.member_offsets.end()
+            );
+            
+            // Add new offsets that don't exist
             for (sval_t off : curr.member_offsets) {
-                bool found = false;
-                for (sval_t existing : last.member_offsets) {
-                    if (existing == off) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
+                if (existing_offsets.insert(off).second) {
                     last.member_offsets.push_back(off);
                 }
             }

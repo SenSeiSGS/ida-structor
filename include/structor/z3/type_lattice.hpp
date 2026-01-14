@@ -217,6 +217,18 @@ public:
     
     /// Get pointer size
     [[nodiscard]] uint32_t ptr_size() const noexcept { return ptr_size_; }
+    
+    /// Clear the memoization caches
+    void clear_cache() const noexcept { lub_cache_.clear(); glb_cache_.clear(); }
+    
+    /// Get cache statistics
+    struct CacheStats {
+        size_t lub_hits = 0;
+        size_t lub_misses = 0;
+        size_t glb_hits = 0;
+        size_t glb_misses = 0;
+    };
+    [[nodiscard]] CacheStats cache_stats() const noexcept { return stats_; }
 
 private:
     uint32_t ptr_size_;
@@ -226,6 +238,37 @@ private:
     
     /// Check if unsigned integer a is subtype of unsigned integer b  
     [[nodiscard]] bool unsigned_int_subtype(BaseType a, BaseType b) const noexcept;
+    
+    /// Internal LUB implementation without caching
+    [[nodiscard]] InferredType lub_impl(const InferredType& a, const InferredType& b) const;
+    
+    /// Internal GLB implementation without caching
+    [[nodiscard]] InferredType glb_impl(const InferredType& a, const InferredType& b) const;
+    
+    /// Cache key for type pairs - optimized for minimal collisions
+    struct TypePairKey {
+        std::size_t hash_a;
+        std::size_t hash_b;
+        
+        bool operator==(const TypePairKey& other) const noexcept {
+            return hash_a == other.hash_a && hash_b == other.hash_b;
+        }
+    };
+    
+    struct TypePairKeyHash {
+        std::size_t operator()(const TypePairKey& k) const noexcept {
+            // FNV-1a style mixing with golden ratio - better avalanche than XOR
+            constexpr std::size_t kGoldenRatio = 0x9e3779b97f4a7c15ULL;
+            std::size_t h = k.hash_a;
+            h ^= k.hash_b + kGoldenRatio + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    
+    /// Memoization caches for LUB and GLB
+    mutable std::unordered_map<TypePairKey, InferredType, TypePairKeyHash> lub_cache_;
+    mutable std::unordered_map<TypePairKey, InferredType, TypePairKeyHash> glb_cache_;
+    mutable CacheStats stats_;
 };
 
 /// Encodes InferredType to Z3 expressions

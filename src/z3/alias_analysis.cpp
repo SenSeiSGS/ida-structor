@@ -1,5 +1,7 @@
 #include "structor/z3/alias_analysis.hpp"
 #include "structor/z3/context.hpp"
+#include "structor/optimized_algorithms.hpp"
+#include "structor/optimized_containers.hpp"
 #include <algorithm>
 #include <functional>
 

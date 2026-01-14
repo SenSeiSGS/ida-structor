@@ -9,6 +9,7 @@
 #include "pseudocode_rewriter.hpp"
 #include "structure_persistence.hpp"
 #include "ui_integration.hpp"
+#include "type_fixer.hpp"
 
 namespace structor {
 
@@ -59,6 +60,27 @@ public:
         int var_idx,
         const tinfo_t& type,
         PropagationDirection direction = PropagationDirection::Both);
+
+    /// Fix types for all variables in a function
+    /// Analyzes access patterns and applies inferred types when significantly different
+    [[nodiscard]] TypeFixResult fix_function_types(
+        ea_t func_ea,
+        const TypeFixerConfig* config = nullptr);
+
+    /// Fix types for a specific variable in a function
+    [[nodiscard]] VariableTypeFix fix_variable_type(
+        ea_t func_ea,
+        int var_idx,
+        const TypeFixerConfig* config = nullptr);
+
+    /// Fix types for a variable by name
+    [[nodiscard]] VariableTypeFix fix_variable_type(
+        ea_t func_ea,
+        const char* var_name,
+        const TypeFixerConfig* config = nullptr);
+
+    /// Analyze types without fixing (dry run)
+    [[nodiscard]] TypeFixResult analyze_function_types(ea_t func_ea);
 
     /// Get current configuration
     [[nodiscard]] const SynthOptions& get_options() const {
@@ -179,6 +201,101 @@ inline PropagationResult StructorAPI::propagate_type(
 {
     TypePropagator propagator;
     return propagator.propagate(func_ea, var_idx, type, direction);
+}
+
+inline TypeFixResult StructorAPI::fix_function_types(
+    ea_t func_ea,
+    const TypeFixerConfig* config)
+{
+    TypeFixerConfig cfg = config ? *config : TypeFixerConfig();
+    TypeFixer fixer(cfg);
+    return fixer.fix_function_types(func_ea);
+}
+
+inline VariableTypeFix StructorAPI::fix_variable_type(
+    ea_t func_ea,
+    int var_idx,
+    const TypeFixerConfig* config)
+{
+    VariableTypeFix result;
+    result.var_idx = var_idx;
+
+    cfuncptr_t cfunc = utils::get_cfunc(func_ea);
+    if (!cfunc) {
+        result.skip_reason = "Failed to decompile function";
+        return result;
+    }
+
+    lvars_t* lvars = cfunc->get_lvars();
+    if (!lvars || var_idx < 0 || static_cast<size_t>(var_idx) >= lvars->size()) {
+        result.skip_reason = "Invalid variable index";
+        return result;
+    }
+
+    result.var_name = lvars->at(var_idx).name;
+    result.is_argument = lvars->at(var_idx).is_arg_var();
+
+    TypeFixerConfig cfg = config ? *config : TypeFixerConfig();
+    TypeFixer fixer(cfg);
+    
+    // Analyze the variable
+    result.comparison = fixer.analyze_variable(cfunc, var_idx);
+    
+    // Apply fix if significant and not dry run
+    if (result.comparison.is_significant() && !cfg.dry_run) {
+        PropagationResult prop;
+        if (fixer.apply_fix(cfunc, var_idx, result.comparison.inferred_type, 
+                           cfg.propagate_fixes ? &prop : nullptr)) {
+            result.applied = true;
+            result.propagation = std::move(prop);
+        } else {
+            result.skip_reason = "Failed to apply type";
+        }
+    } else if (!result.comparison.is_significant()) {
+        result.skip_reason.sprnt("Not significant (%s)", 
+            type_difference_str(result.comparison.difference));
+    } else {
+        result.skip_reason = "Dry run mode";
+    }
+
+    return result;
+}
+
+inline VariableTypeFix StructorAPI::fix_variable_type(
+    ea_t func_ea,
+    const char* var_name,
+    const TypeFixerConfig* config)
+{
+    VariableTypeFix result;
+
+    cfuncptr_t cfunc = utils::get_cfunc(func_ea);
+    if (!cfunc) {
+        result.skip_reason = "Failed to decompile function";
+        return result;
+    }
+
+    lvar_t* var = utils::find_lvar_by_name(cfunc, var_name);
+    if (!var) {
+        result.skip_reason.sprnt("Variable '%s' not found", var_name);
+        return result;
+    }
+
+    lvars_t& lvars = *cfunc->get_lvars();
+    for (size_t i = 0; i < lvars.size(); ++i) {
+        if (&lvars[i] == var) {
+            return fix_variable_type(func_ea, static_cast<int>(i), config);
+        }
+    }
+
+    result.skip_reason = "Variable index lookup failed";
+    return result;
+}
+
+inline TypeFixResult StructorAPI::analyze_function_types(ea_t func_ea) {
+    TypeFixerConfig cfg;
+    cfg.dry_run = true;  // Don't actually apply changes
+    TypeFixer fixer(cfg);
+    return fixer.fix_function_types(func_ea);
 }
 
 inline SynthResult StructorAPI::do_synthesis(ea_t func_ea, int var_idx, const SynthOptions& opts) {

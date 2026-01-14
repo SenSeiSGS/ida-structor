@@ -1,16 +1,23 @@
 #include "structor/z3/constraint_tracker.hpp"
-#include <sstream>
+#include <cstdio>
 
 namespace structor::z3 {
 
 ConstraintTracker::ConstraintTracker(::z3::context& ctx)
     : ctx_(ctx) {
+    // Pre-reserve typical capacity to avoid reallocations
+    provenance_map_.reserve(256);
+    expr_to_id_.reserve(256);
+    hard_constraint_ids_.reserve(128);
+    soft_constraint_ids_.reserve(128);
+    tracking_exprs_.reserve(256);
 }
 
 std::string ConstraintTracker::make_tracking_name(unsigned id) const {
-    std::ostringstream ss;
-    ss << "__track_" << id;
-    return ss.str();
+    // Use snprintf instead of ostringstream for ~3x faster string creation
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "__track_%u", id);
+    return std::string(buf);
 }
 
 ::z3::expr ConstraintTracker::make_tracking_literal(unsigned id) {

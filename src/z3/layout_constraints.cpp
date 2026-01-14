@@ -1,4 +1,7 @@
 #include "structor/z3/layout_constraints.hpp"
+#include "structor/optimized_algorithms.hpp"
+#include "structor/optimized_containers.hpp"
+#include "structor/simd.hpp"
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
@@ -282,17 +285,37 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
     z3_log("[Structor/Z3] Adding coverage constraints for %zu accesses\n", pattern_->all_accesses.size());
     int uncovered_count = 0;
 
-    for (size_t i = 0; i < pattern_->all_accesses.size(); ++i) {
+    // Pre-compute candidate bounds for faster coverage checking
+    const size_t num_candidates = candidates_.size();
+    const size_t num_accesses = pattern_->all_accesses.size();
+    
+    // Prefetch candidate data
+    if (num_candidates > 0) {
+        simd::prefetch_range(&candidates_[0], 
+            std::min(num_candidates * sizeof(FieldCandidate), size_t{simd::kCacheLine * 8}));
+    }
+
+    for (size_t i = 0; i < num_accesses; ++i) {
         const auto& access = pattern_->all_accesses[i];
+        
+        // Prefetch next access
+        if (STRUCTOR_LIKELY(i + 2 < num_accesses)) {
+            STRUCTOR_PREFETCH_READ(&pattern_->all_accesses[i + 2]);
+        }
 
         // Build: OR of all candidates that cover this access
         ::z3::expr_vector covering(ctx);
 
-        for (const auto& fv : field_vars_) {
-            const auto& cand = candidates_[fv.candidate_id];
+        for (size_t j = 0; j < num_candidates; ++j) {
+            // Prefetch next candidate
+            if (STRUCTOR_LIKELY(j + 4 < num_candidates)) {
+                STRUCTOR_PREFETCH_READ(&candidates_[j + 4]);
+            }
+            
+            const auto& cand = candidates_[field_vars_[j].candidate_id];
 
             if (candidate_covers_access(cand, access)) {
-                covering.push_back(fv.selected);
+                covering.push_back(field_vars_[j].selected);
             }
         }
 
@@ -345,34 +368,39 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
     int overlap_count = 0;
     int non_overlap_union_constraints = 0;
 
-    for (size_t i = 0; i < field_vars_.size(); ++i) {
-        for (size_t j = i + 1; j < field_vars_.size(); ++j) {
-            const auto& fv1 = field_vars_[i];
-            const auto& fv2 = field_vars_[j];
+    // OPTIMIZATION: Use O(n log n) sweep line algorithm for large candidate sets
+    // instead of O(n²) pairwise comparison
+    const size_t n = field_vars_.size();
+    
+    if (n >= 64) {
+        // Use sweep line for large sets - O(n log n + k) where k is overlapping pairs
+        std::vector<algorithms::Interval> intervals;
+        intervals.reserve(n);
+        
+        for (size_t i = 0; i < n; ++i) {
+            const auto& c = candidates_[field_vars_[i].candidate_id];
+            intervals.emplace_back(
+                c.offset,
+                c.offset + static_cast<int64_t>(c.size),
+                static_cast<int32_t>(i)
+            );
+        }
+        
+        auto overlapping_pairs = algorithms::find_overlapping_pairs(intervals);
+        
+        z3_log("[Structor/Z3]   Using sweep line: found %zu overlapping pairs from %zu candidates\n",
+               overlapping_pairs.size(), n);
+        
+        // Process overlapping pairs
+        for (const auto& [idx_i, idx_j] : overlapping_pairs) {
+            const auto& fv1 = field_vars_[idx_i];
+            const auto& fv2 = field_vars_[idx_j];
             const auto& c1 = candidates_[fv1.candidate_id];
             const auto& c2 = candidates_[fv2.candidate_id];
-
-            // Check if candidates could overlap
-            bool could_overlap = c1.overlaps(c2);
-
-            if (!could_overlap) {
-                // Non-overlapping fields cannot be in the same union group
-                // This prevents Z3 from putting all fields in one union
-                if (config_.allow_unions) {
-                    ::z3::expr different_groups = 
-                        !fv1.is_union_member || !fv2.is_union_member ||
-                        (fv1.union_group != fv2.union_group);
-                    
-                    // Add as hard constraint (not tracked, always true)
-                    solver_.add(::z3::implies(fv1.selected && fv2.selected, different_groups));
-                    ++non_overlap_union_constraints;
-                }
-                continue;
-            }
+            
             ++overlap_count;
-
+            
             if (config_.allow_unions) {
-                // Either non-overlapping OR both are union members in same group
                 ::z3::expr non_overlap =
                     (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
                     (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
@@ -396,7 +424,6 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
 
                 constraint_tracker_.add_soft(solver_, constraint, prov, config_.weight_minimize_fields);
             } else {
-                // Hard non-overlap
                 ::z3::expr non_overlap =
                     (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
                     (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
@@ -413,6 +440,103 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
                 prov.kind = ConstraintProvenance::Kind::NonOverlap;
 
                 constraint_tracker_.add_hard(solver_, constraint, prov);
+            }
+        }
+        
+        // For non-overlapping pairs in union mode, add different-groups constraints
+        // Build a set of overlapping pairs for quick lookup using FlatHashSet
+        if (config_.allow_unions) {
+            FlatHashSet<uint64_t> overlap_set;
+            overlap_set.reserve(overlapping_pairs.size());
+            for (const auto& [i, j] : overlapping_pairs) {
+                uint32_t lo = static_cast<uint32_t>(std::min(i, j));
+                uint32_t hi = static_cast<uint32_t>(std::max(i, j));
+                overlap_set.insert((static_cast<uint64_t>(hi) << 32) | lo);
+            }
+            
+            // Add different-groups for non-overlapping pairs
+            for (size_t i = 0; i < n; ++i) {
+                for (size_t j = i + 1; j < n; ++j) {
+                    uint64_t key = (static_cast<uint64_t>(j) << 32) | i;
+                    if (!overlap_set.contains(key)) {
+                        const auto& fv1 = field_vars_[i];
+                        const auto& fv2 = field_vars_[j];
+                        
+                        ::z3::expr different_groups = 
+                            !fv1.is_union_member || !fv2.is_union_member ||
+                            (fv1.union_group != fv2.union_group);
+                        
+                        solver_.add(::z3::implies(fv1.selected && fv2.selected, different_groups));
+                        ++non_overlap_union_constraints;
+                    }
+                }
+            }
+        }
+    } else {
+        // Small set - use O(n²) which has lower constant factors
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const auto& fv1 = field_vars_[i];
+                const auto& fv2 = field_vars_[j];
+                const auto& c1 = candidates_[fv1.candidate_id];
+                const auto& c2 = candidates_[fv2.candidate_id];
+
+                bool could_overlap = c1.overlaps(c2);
+
+                if (!could_overlap) {
+                    if (config_.allow_unions) {
+                        ::z3::expr different_groups = 
+                            !fv1.is_union_member || !fv2.is_union_member ||
+                            (fv1.union_group != fv2.union_group);
+                        
+                        solver_.add(::z3::implies(fv1.selected && fv2.selected, different_groups));
+                        ++non_overlap_union_constraints;
+                    }
+                    continue;
+                }
+                ++overlap_count;
+
+                if (config_.allow_unions) {
+                    ::z3::expr non_overlap =
+                        (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
+                        (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
+
+                    ::z3::expr same_union =
+                        fv1.is_union_member && fv2.is_union_member &&
+                        (fv1.union_group == fv2.union_group) &&
+                        (fv1.union_group >= 0);
+
+                    ::z3::expr constraint = ::z3::implies(
+                        fv1.selected && fv2.selected,
+                        non_overlap || same_union
+                    );
+
+                    ConstraintProvenance prov;
+                    prov.description.sprnt("Non-overlap or union at 0x%llX",
+                        static_cast<unsigned long long>(c1.offset));
+                    prov.is_soft = true;
+                    prov.kind = ConstraintProvenance::Kind::NonOverlap;
+                    prov.weight = config_.weight_minimize_fields;
+
+                    constraint_tracker_.add_soft(solver_, constraint, prov, config_.weight_minimize_fields);
+                } else {
+                    ::z3::expr non_overlap =
+                        (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
+                        (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
+
+                    ::z3::expr constraint = ::z3::implies(
+                        fv1.selected && fv2.selected,
+                        non_overlap
+                    );
+
+                    ConstraintProvenance prov;
+                    prov.description.sprnt("Non-overlap at 0x%llX",
+                        static_cast<unsigned long long>(c1.offset));
+                    prov.is_soft = false;
+                    prov.kind = ConstraintProvenance::Kind::NonOverlap;
+
+                    constraint_tracker_.add_hard(solver_, constraint, prov);
+                }
             }
         }
     }
@@ -516,23 +640,35 @@ void LayoutConstraintBuilder::add_type_preference_constraints() {
     // When two overlapping candidates exist, prefer the one with a more specific type
     
     int preference_count = 0;
+    const size_t n = field_vars_.size();
     
-    for (size_t i = 0; i < field_vars_.size(); ++i) {
-        for (size_t j = i + 1; j < field_vars_.size(); ++j) {
-            const auto& c1 = candidates_[field_vars_[i].candidate_id];
-            const auto& c2 = candidates_[field_vars_[j].candidate_id];
+    // OPTIMIZATION: Use sweep-line for large candidate sets
+    if (n >= 64) {
+        // Build interval list for sweep-line overlap detection
+        std::vector<algorithms::Interval> intervals;
+        intervals.reserve(n);
+        
+        for (size_t i = 0; i < n; ++i) {
+            const auto& c = candidates_[field_vars_[i].candidate_id];
+            intervals.emplace_back(
+                c.offset,
+                c.offset + static_cast<int64_t>(c.size),
+                static_cast<int32_t>(i)
+            );
+        }
+        
+        auto overlapping_pairs = algorithms::find_overlapping_pairs(intervals);
+        
+        for (const auto& [idx_i, idx_j] : overlapping_pairs) {
+            const auto& c1 = candidates_[field_vars_[idx_i].candidate_id];
+            const auto& c2 = candidates_[field_vars_[idx_j].candidate_id];
             
-            // Only for overlapping candidates
-            if (!c1.overlaps(c2)) continue;
-            
-            // Determine which one is more specifically typed
             bool c1_is_raw = (c1.type_category == TypeCategory::RawBytes || 
                               c1.type_category == TypeCategory::Unknown);
             bool c2_is_raw = (c2.type_category == TypeCategory::RawBytes || 
                               c2.type_category == TypeCategory::Unknown);
             
             if (c1_is_raw && !c2_is_raw) {
-                // Prefer c2 (typed) over c1 (raw)
                 ConstraintProvenance prov;
                 prov.description.sprnt("Prefer typed field at 0x%llX over raw at 0x%llX",
                     static_cast<unsigned long long>(c2.offset),
@@ -542,12 +678,10 @@ void LayoutConstraintBuilder::add_type_preference_constraints() {
                 prov.kind = ConstraintProvenance::Kind::TypeMatch;
                 prov.weight = weight;
                 
-                // Prefer the typed candidate by penalizing selecting raw when typed exists
-                constraint_tracker_.add_soft(solver_, !field_vars_[i].selected, prov, weight);
+                constraint_tracker_.add_soft(solver_, !field_vars_[idx_i].selected, prov, weight);
                 ++preference_count;
             }
             else if (c2_is_raw && !c1_is_raw) {
-                // Prefer c1 (typed) over c2 (raw)
                 ConstraintProvenance prov;
                 prov.description.sprnt("Prefer typed field at 0x%llX over raw at 0x%llX",
                     static_cast<unsigned long long>(c1.offset),
@@ -557,8 +691,55 @@ void LayoutConstraintBuilder::add_type_preference_constraints() {
                 prov.kind = ConstraintProvenance::Kind::TypeMatch;
                 prov.weight = weight;
                 
-                constraint_tracker_.add_soft(solver_, !field_vars_[j].selected, prov, weight);
+                constraint_tracker_.add_soft(solver_, !field_vars_[idx_j].selected, prov, weight);
                 ++preference_count;
+            }
+        }
+    } else {
+        // Small set - use O(n²) with lower constant factors
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const auto& c1 = candidates_[field_vars_[i].candidate_id];
+                const auto& c2 = candidates_[field_vars_[j].candidate_id];
+                
+                // Only for overlapping candidates
+                if (!c1.overlaps(c2)) continue;
+                
+                // Determine which one is more specifically typed
+                bool c1_is_raw = (c1.type_category == TypeCategory::RawBytes || 
+                                  c1.type_category == TypeCategory::Unknown);
+                bool c2_is_raw = (c2.type_category == TypeCategory::RawBytes || 
+                                  c2.type_category == TypeCategory::Unknown);
+                
+                if (c1_is_raw && !c2_is_raw) {
+                    // Prefer c2 (typed) over c1 (raw)
+                    ConstraintProvenance prov;
+                    prov.description.sprnt("Prefer typed field at 0x%llX over raw at 0x%llX",
+                        static_cast<unsigned long long>(c2.offset),
+                        static_cast<unsigned long long>(c1.offset));
+                    int weight = access_weight(c2, 1);
+                    prov.is_soft = true;
+                    prov.kind = ConstraintProvenance::Kind::TypeMatch;
+                    prov.weight = weight;
+                    
+                    // Prefer the typed candidate by penalizing selecting raw when typed exists
+                    constraint_tracker_.add_soft(solver_, !field_vars_[i].selected, prov, weight);
+                    ++preference_count;
+                }
+                else if (c2_is_raw && !c1_is_raw) {
+                    // Prefer c1 (typed) over c2 (raw)
+                    ConstraintProvenance prov;
+                    prov.description.sprnt("Prefer typed field at 0x%llX over raw at 0x%llX",
+                        static_cast<unsigned long long>(c1.offset),
+                        static_cast<unsigned long long>(c2.offset));
+                    int weight = access_weight(c1, 1);
+                    prov.is_soft = true;
+                    prov.kind = ConstraintProvenance::Kind::TypeMatch;
+                    prov.weight = weight;
+                    
+                    constraint_tracker_.add_soft(solver_, !field_vars_[j].selected, prov, weight);
+                    ++preference_count;
+                }
             }
         }
     }

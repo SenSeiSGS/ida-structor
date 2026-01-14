@@ -1,5 +1,7 @@
 #include "structor/z3/field_candidates.hpp"
 #include "structor/z3/array_constraints.hpp"
+#include "structor/optimized_algorithms.hpp"
+#include "structor/optimized_containers.hpp"
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +46,9 @@ qvector<FieldCandidate> FieldCandidateGenerator::generate(
     if (pattern.all_accesses.empty()) {
         return candidates;
     }
+
+    // Pre-allocate: estimate ~1.5x accesses for direct + covering + arrays + padding
+    candidates.reserve(pattern.all_accesses.size() * 3 / 2 + 16);
 
     // Step 1: Generate direct access candidates
     generate_direct_candidates(pattern, candidates);
@@ -519,14 +524,37 @@ OverlapAnalysis FieldCandidateGenerator::analyze_overlaps(
 {
     OverlapAnalysis result;
 
-    // Find all overlapping pairs
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        for (size_t j = i + 1; j < candidates.size(); ++j) {
-            if (candidates[i].overlaps(candidates[j])) {
-                result.overlapping_pairs.push_back({
-                    candidates[i].id,
-                    candidates[j].id
-                });
+    // OPTIMIZATION: Use sweep line for large sets, O(n²) for small sets
+    const size_t n = candidates.size();
+    
+    if (n >= 64) {
+        // Use sweep line algorithm - O(n log n + k)
+        std::vector<algorithms::Interval> intervals;
+        intervals.reserve(n);
+        
+        for (size_t i = 0; i < n; ++i) {
+            intervals.emplace_back(
+                candidates[i].offset,
+                candidates[i].offset + static_cast<int64_t>(candidates[i].size),
+                static_cast<int32_t>(candidates[i].id)
+            );
+        }
+        
+        auto overlapping = algorithms::find_overlapping_pairs(intervals);
+        
+        for (const auto& [id1, id2] : overlapping) {
+            result.overlapping_pairs.push_back({id1, id2});
+        }
+    } else {
+        // Use O(n²) for small sets - lower constant factors
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (candidates[i].overlaps(candidates[j])) {
+                    result.overlapping_pairs.push_back({
+                        candidates[i].id,
+                        candidates[j].id
+                    });
+                }
             }
         }
     }
@@ -535,37 +563,28 @@ OverlapAnalysis FieldCandidateGenerator::analyze_overlaps(
         return result;
     }
 
-    // Build overlap groups using union-find
-    std::unordered_map<int, int> parent;
-
-    auto find = [&parent](int x) -> int {
-        if (parent.find(x) == parent.end()) {
-            parent[x] = x;
-        }
-        while (parent[x] != x) {
-            parent[x] = parent[parent[x]];  // Path compression
-            x = parent[x];
-        }
-        return x;
-    };
-
-    auto unite = [&parent, &find](int x, int y) {
-        int px = find(x);
-        int py = find(y);
-        if (px != py) {
-            parent[px] = py;
-        }
-    };
-
+    // OPTIMIZATION: Use optimized FlatUnionFind
+    FlatUnionFind uf;
+    
     // Unite overlapping candidates
     for (const auto& [id1, id2] : result.overlapping_pairs) {
-        unite(id1, id2);
+        uf.unite_by_id(id1, id2);
     }
 
-    // Collect groups
-    std::unordered_map<int, qvector<int>> groups;
-    for (const auto& [id, _] : parent) {
-        groups[find(id)].push_back(id);
+    // Collect groups - use root as key to group overlapping candidates
+    std::unordered_map<size_t, qvector<int>> groups;
+    for (const auto& [id1, id2] : result.overlapping_pairs) {
+        size_t root = uf.find_by_id(id1);
+        // Both id1 and id2 have same root since they were united
+        
+        // Track both IDs under the root
+        auto& group = groups[root];
+        if (std::find(group.begin(), group.end(), id1) == group.end()) {
+            group.push_back(id1);
+        }
+        if (std::find(group.begin(), group.end(), id2) == group.end()) {
+            group.push_back(id2);
+        }
     }
 
     for (auto& [root, members] : groups) {

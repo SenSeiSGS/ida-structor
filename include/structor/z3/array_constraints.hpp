@@ -5,6 +5,7 @@
 #include "structor/synth_types.hpp"
 #include "structor/z3/context.hpp"
 #include "structor/z3/type_encoding.hpp"
+#include "structor/optimized_algorithms.hpp"
 
 namespace structor::z3 {
 
@@ -205,25 +206,14 @@ private:
     return true;
 }
 
-/// Find the GCD of two integers
-[[nodiscard]] inline uint32_t gcd(uint32_t a, uint32_t b) {
-    while (b != 0) {
-        uint32_t t = b;
-        b = a % b;
-        a = t;
-    }
-    return a;
+/// Find the GCD of two integers (optimized binary GCD / Stein's algorithm)
+[[nodiscard]] inline uint32_t gcd(uint32_t a, uint32_t b) noexcept {
+    return algorithms::binary_gcd(a, b);
 }
 
-/// Calculate the GCD of a vector of values
-[[nodiscard]] inline uint32_t gcd_vector(const qvector<uint32_t>& values) {
-    if (values.empty()) return 0;
-    uint32_t result = values[0];
-    for (size_t i = 1; i < values.size(); ++i) {
-        result = gcd(result, values[i]);
-        if (result == 1) break;
-    }
-    return result;
+/// Calculate the GCD of a vector of values (optimized with early termination)
+[[nodiscard]] inline uint32_t gcd_vector(const qvector<uint32_t>& values) noexcept {
+    return algorithms::gcd_array(values);
 }
 
 } // namespace structor::z3

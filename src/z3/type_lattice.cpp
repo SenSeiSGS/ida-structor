@@ -440,34 +440,74 @@ bool InferredType::operator==(const InferredType& other) const {
 }
 
 std::size_t InferredType::hash() const noexcept {
-    std::size_t h = std::hash<int>{}(static_cast<int>(kind_));
+    // Use FNV-1a inspired mixing with better avalanche properties
+    constexpr std::size_t kFNVPrime = 0x100000001b3ULL;
+    constexpr std::size_t kFNVOffset = 0xcbf29ce484222325ULL;
+    constexpr std::size_t kGoldenRatio = 0x9e3779b97f4a7c15ULL;
+    
+    std::size_t h = kFNVOffset;
+    
+    // Mix kind into hash
+    h = (h ^ static_cast<std::size_t>(kind_)) * kFNVPrime;
     
     switch (kind_) {
         case Kind::Base:
-            h ^= std::hash<int>{}(static_cast<int>(base_type_)) << 1;
+            // Combine with golden ratio for better distribution
+            h ^= static_cast<std::size_t>(base_type_) + kGoldenRatio + (h << 6) + (h >> 2);
             break;
+            
         case Kind::Pointer:
-            if (pointee_) h ^= pointee_->hash() << 2;
-            break;
-        case Kind::Function:
-            if (return_type_) h ^= return_type_->hash() << 3;
-            for (const auto& p : param_types_) {
-                h ^= p->hash();
+            if (pointee_) {
+                // Use iterative unwrapping for pointer chains to avoid deep recursion
+                const InferredType* curr = pointee_.get();
+                unsigned depth = 0;
+                while (curr && curr->is_pointer() && depth < 16) {
+                    ++depth;
+                    h = (h ^ depth) * kFNVPrime;
+                    curr = curr->pointee();
+                }
+                if (curr) {
+                    h ^= curr->hash() + kGoldenRatio + (h << 6) + (h >> 2);
+                }
+                h = (h ^ depth) * kFNVPrime;
+            } else {
+                h = (h ^ 0xDEADBEEFULL) * kFNVPrime;  // void*
             }
             break;
+            
+        case Kind::Function:
+            if (return_type_) {
+                h ^= return_type_->hash() + kGoldenRatio + (h << 6) + (h >> 2);
+            }
+            h = (h ^ param_types_.size()) * kFNVPrime;
+            for (size_t i = 0; i < param_types_.size() && i < 8; ++i) {
+                h ^= param_types_[i]->hash() + kGoldenRatio + (h << 6) + (h >> 2);
+            }
+            break;
+            
         case Kind::Array:
-            if (element_type_) h ^= element_type_->hash() << 4;
-            h ^= std::hash<uint32_t>{}(array_count_);
+            if (element_type_) {
+                h ^= element_type_->hash() + kGoldenRatio + (h << 6) + (h >> 2);
+            }
+            h = (h ^ array_count_) * kFNVPrime;
             break;
+            
         case Kind::Struct:
-            h ^= std::hash<ea_t>{}(struct_tid_);
+            h ^= static_cast<std::size_t>(struct_tid_) + kGoldenRatio + (h << 6) + (h >> 2);
             break;
+            
         case Kind::Sum:
-            for (const auto& alt : sum_alternatives_) {
-                h ^= alt->hash();
+            h = (h ^ sum_alternatives_.size()) * kFNVPrime;
+            for (size_t i = 0; i < sum_alternatives_.size() && i < 4; ++i) {
+                h ^= sum_alternatives_[i]->hash() + kGoldenRatio + (h << 6) + (h >> 2);
             }
             break;
     }
+    
+    // Final mixing
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
     
     return h;
 }
@@ -566,13 +606,26 @@ bool TypeLattice::is_subtype(const InferredType& a, const InferredType& b) const
 }
 
 InferredType TypeLattice::lub(const InferredType& a, const InferredType& b) const {
-    // LUB(x, unknown) = unknown
+    // Fast path: check trivial cases first (no caching needed)
     if (a.is_unknown() || b.is_unknown()) return InferredType::unknown();
-    
-    // LUB(x, bottom) = x
     if (a.is_bottom()) return b;
     if (b.is_bottom()) return a;
     
+    // Check cache
+    TypePairKey key{a.hash(), b.hash()};
+    auto it = lub_cache_.find(key);
+    if (it != lub_cache_.end()) {
+        ++stats_.lub_hits;
+        return it->second;
+    }
+    
+    ++stats_.lub_misses;
+    InferredType result = lub_impl(a, b);
+    lub_cache_.emplace(key, result);
+    return result;
+}
+
+InferredType TypeLattice::lub_impl(const InferredType& a, const InferredType& b) const {
     // If one is subtype of other, return the supertype
     if (is_subtype(a, b)) return b;
     if (is_subtype(b, a)) return a;
@@ -632,13 +685,26 @@ InferredType TypeLattice::lub(const InferredType& a, const InferredType& b) cons
 }
 
 InferredType TypeLattice::glb(const InferredType& a, const InferredType& b) const {
-    // GLB(x, bottom) = bottom
+    // Fast path: check trivial cases first (no caching needed)
     if (a.is_bottom() || b.is_bottom()) return InferredType::bottom();
-    
-    // GLB(x, unknown) = x
     if (a.is_unknown()) return b;
     if (b.is_unknown()) return a;
     
+    // Check cache
+    TypePairKey key{a.hash(), b.hash()};
+    auto it = glb_cache_.find(key);
+    if (it != glb_cache_.end()) {
+        ++stats_.glb_hits;
+        return it->second;
+    }
+    
+    ++stats_.glb_misses;
+    InferredType result = glb_impl(a, b);
+    glb_cache_.emplace(key, result);
+    return result;
+}
+
+InferredType TypeLattice::glb_impl(const InferredType& a, const InferredType& b) const {
     // If one is subtype of other, return the subtype
     if (is_subtype(a, b)) return a;
     if (is_subtype(b, a)) return b;

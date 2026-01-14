@@ -141,6 +141,10 @@ struct SynthOptions {
     bool            debug_mode;         // Enable debug logging (adopted from Suture)
     AccessPredicate access_filter;      // Filter predicate for accesses (adopted from Suture)
 
+    // Automatic type fixing options
+    bool            auto_fix_types;     // Automatically fix types when decompiling
+    bool            auto_fix_verbose;   // Print messages about auto-fixed types
+
     // Z3-specific options
     Z3Options       z3;                 // Z3 synthesis configuration
 
@@ -161,6 +165,8 @@ struct SynthOptions {
         , emit_substructs(true)
         , debug_mode(false)
         , access_filter(predicates::accept_all)
+        , auto_fix_types(true)
+        , auto_fix_verbose(false)
         , z3() {}
 };
 
@@ -258,7 +264,8 @@ inline bool Config::load() {
 
     std::ifstream file(path);
     if (!file.is_open()) {
-        // No config file, use defaults
+        // No config file, create one with defaults
+        save();
         return true;
     }
 
@@ -315,6 +322,12 @@ inline bool Config::load() {
             options_.emit_substructs = parse_bool(value);
         } else if (key == "debug_mode") {
             options_.debug_mode = parse_bool(value);
+        }
+        // Auto type fixing options
+        else if (key == "auto_fix_types") {
+            options_.auto_fix_types = parse_bool(value);
+        } else if (key == "auto_fix_verbose") {
+            options_.auto_fix_verbose = parse_bool(value);
         }
         // Z3 options
         else if (key == "z3_mode") {
@@ -376,6 +389,11 @@ inline bool Config::save() {
     file << "interactive_mode=" << (options_.interactive_mode ? "true" : "false") << "\n";
     file << "auto_open_struct=" << (options_.auto_open_struct ? "true" : "false") << "\n";
     file << "debug_mode=" << (options_.debug_mode ? "true" : "false") << "\n";
+    file << "\n";
+
+    file << "[TypeFix]\n";
+    file << "auto_fix_types=" << (options_.auto_fix_types ? "true" : "false") << "\n";
+    file << "auto_fix_verbose=" << (options_.auto_fix_verbose ? "true" : "false") << "\n";
     file << "\n";
 
     file << "[Synthesis]\n";
