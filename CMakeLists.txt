@@ -232,17 +232,27 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/include
 )
 
-# Source files
+# Source files - organized by module
 set(STRUCTOR_SOURCES
-    src/plugin.cpp
-    src/config.cpp
-    src/access_collector.cpp
-    src/layout_synthesizer.cpp
-    src/vtable_detector.cpp
-    src/type_propagator.cpp
-    src/pseudocode_rewriter.cpp
-    src/structure_persistence.cpp
-    src/ui_integration.cpp
+    # Core module
+    src/core/config.cpp
+    
+    # Analysis module
+    src/analysis/access_collector.cpp
+    src/analysis/cross_function_analyzer.cpp
+    src/analysis/vtable_detector.cpp
+    
+    # Synthesis module
+    src/synthesis/layout_synthesizer.cpp
+    src/synthesis/structure_persistence.cpp
+    src/synthesis/type_propagator.cpp
+    
+    # UI module
+    src/ui/plugin.cpp
+    src/ui/pseudocode_rewriter.cpp
+    src/ui/ui_integration.cpp
+    
+    # Z3 module
     src/z3/context.cpp
     src/z3/type_encoding.cpp
     src/z3/constraint_tracker.cpp
@@ -254,7 +264,6 @@ set(STRUCTOR_SOURCES
     src/z3/type_inference_engine.cpp
     src/z3/alias_analysis.cpp
     src/z3/type_applicator.cpp
-    src/cross_function_analyzer.cpp
 )
 
 set(STRUCTOR_HEADERS
